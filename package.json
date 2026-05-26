@@ -1,0 +1,23 @@
+{
+  "name": "ai-interview-assistant-frontend",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "test:frontend": "vitest run",
+    "smoke:frontend": "vitest run frontend/src/__tests__/app.spec.js"
+  },
+  "dependencies": {
+    "echarts": "^5.6.0",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "@vue/test-utils": "^2.4.6",
+    "jsdom": "^25.0.1",
+    "vite": "^6.0.7",
+    "vitest": "^2.1.8"
+  }
+}

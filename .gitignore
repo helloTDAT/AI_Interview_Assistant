@@ -1,0 +1,12 @@
+.env
+.idea/
+.venv/
+__pycache__/
+.pytest_cache/
+.pytest-tmp/
+uploads/
+*.pyc
+node_modules/
+.npm-cache/
+dist/
+*.log

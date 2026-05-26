@@ -1,0 +1,1 @@
+"""Smart interview assistant backend."""
