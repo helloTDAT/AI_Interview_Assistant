@@ -22,7 +22,7 @@
     </div>
     <div v-else class="star-empty">
       <strong>项目经历证据不足</strong>
-      <p>上传可解析的项目经历后，会在这里生成 Before / After / 动作说明的 STAR 改写。</p>
+      <p>上传可解析的项目经历后，这里会生成 Before / After / 动作说明的 STAR 改写。</p>
     </div>
   </section>
 </template>

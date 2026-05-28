@@ -10,3 +10,6 @@ node_modules/
 .npm-cache/
 dist/
 *.log
+.rag/
+*.sqlite3
+*.db

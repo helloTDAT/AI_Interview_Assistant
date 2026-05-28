@@ -133,3 +133,33 @@ def test_resume_agent_falls_back_when_llm_fails(tmp_path: Path):
     assert report.analysis_engine == "rules_fallback"
     assert report.llm_error == "llm http 500"
     assert report.recommendations
+
+
+def test_resume_agent_ignores_isolated_headings_and_vague_words(tmp_path: Path):
+    resume = tmp_path / "headings_resume.docx"
+    doc = Document()
+    doc.add_paragraph("王五")
+    doc.add_paragraph("求职意向：后端开发工程师")
+    doc.add_paragraph("技能：Java Redis MySQL Netty")
+    doc.add_paragraph("项目经历")
+    doc.add_paragraph("【项目背景】")
+    doc.add_paragraph("优化")
+    doc.add_paragraph("提升")
+    doc.add_paragraph("项目名称：分布式 IM 后端系统")
+    doc.add_paragraph("负责使用 Netty 和 Redis 实现消息路由，使用 MySQL 存储会话记录，并完成 10 万连接压测。")
+    doc.save(str(resume))
+
+    report = ResumeEvaluationAgent(llm=FakeFailingLLM()).analyze(
+        resume,
+        target_position="后端开发工程师",
+        user_instruction="请优化项目经历",
+    )
+
+    risk_text = "\n".join(item["risk_point"] + item["question"] for item in report.interview_risks)
+    star_before = report.star_optimizations[0]["before"]
+    assert "【项目背景】" not in risk_text
+    assert "你在简历中提到“优化”" not in risk_text
+    assert "你在简历中提到“提升”" not in risk_text
+    assert "Netty" in risk_text or "Redis" in risk_text
+    assert "【项目背景】" not in star_before
+    assert "分布式 IM 后端系统" in star_before or "Netty" in star_before
