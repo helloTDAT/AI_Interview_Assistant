@@ -3,6 +3,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from app.api import routes
+from app.core.database import review_db
 from app.core.storage import store
 from app.main import app
 from app.services.ai_clients import LLMCallResult, LLMClient
@@ -289,6 +290,104 @@ def test_upload_resume_accepts_jd_and_llm_fields(tmp_path: Path, monkeypatch):
     assert body["star_optimizations"][0]["after"]
 
 
+def test_current_resume_and_cross_agent_reuse_after_upload(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(routes.resume_agent, "llm", LLMClient(api_key=""))
+    resume = tmp_path / "resume.docx"
+    from docx import Document
+
+    doc = Document()
+    doc.add_paragraph("李四")
+    doc.add_paragraph("专业技能：Python Redis MySQL")
+    doc.add_paragraph("项目经历1")
+    doc.add_paragraph("智能面试助手平台：负责后端接口、RAG 检索和练习题推荐模块，实现个性化训练流程。")
+    doc.save(str(resume))
+
+    with resume.open("rb") as handle:
+        upload = client.post(
+            "/files/resume",
+            files={"file": ("resume.docx", handle, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+            data={"user_id": "shared-resume-user", "target_position": "后端开发工程师", "user_instruction": "请分析简历"},
+        )
+
+    assert upload.status_code == 200
+    current = client.get("/resume/current/shared-resume-user")
+    assert current.status_code == 200
+    current_body = current.json()["resume"]
+    assert current_body["available"] is True
+    assert current_body["target_position"] == "后端开发工程师"
+
+    mock = client.post(
+        "/interviews/mock/start",
+        json={"user_id": "shared-resume-user", "target_position": "后端开发工程师", "mode": "project_deep_dive"},
+    )
+    assert mock.status_code == 200
+    mock_body = mock.json()
+    assert mock_body["resume_context_used"] is True
+    assert mock_body["resume_context_summary"]
+    assert "未读取" not in mock_body["resume_context_summary"]
+
+    feed = client.post(
+        "/learning/feed",
+        json={"user_id": "shared-resume-user", "target_position": "后端开发工程师", "limit": 4},
+    )
+    assert feed.status_code == 200
+    feed_body = feed.json()
+    assert feed_body["profile_used"] is True
+    assert "Python" in feed_body["profile_summary"]["skills"]
+
+    second = tmp_path / "resume_v2.docx"
+    doc2 = Document()
+    doc2.add_paragraph("李四")
+    doc2.add_paragraph("专业技能：Java Spring Redis")
+    doc2.add_paragraph("项目经历1")
+    doc2.add_paragraph("订单系统：负责 Java 接口和 Spring 服务拆分。")
+    doc2.save(str(second))
+    with second.open("rb") as handle:
+        overwrite = client.post(
+            "/files/resume",
+            files={"file": ("resume_v2.docx", handle, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+            data={"user_id": "shared-resume-user", "target_position": "Java 开发工程师", "user_instruction": "更新简历画像"},
+        )
+    assert overwrite.status_code == 200
+    updated = client.get("/resume/current/shared-resume-user").json()["resume"]
+    assert updated["target_position"] == "Java 开发工程师"
+    assert "Java" in updated["skills"]
+
+
+def test_mock_interview_uses_raw_text_or_skills_when_projects_are_empty():
+    store.resume_reports["raw-only-user"] = {
+        "profile": {
+            "projects": [],
+            "internships": [],
+            "skills": ["Python", "Redis", "MySQL"],
+            "raw_text": "参与智能面试助手平台，负责 Python 后端接口、Redis 缓存和 MySQL 数据建模，实现练习推荐流程。",
+            "parse_confidence": 0.86,
+        },
+        "job_fit": {"target_position": "后端开发工程师"},
+        "quality_score": 82,
+    }
+
+    response = client.post(
+        "/interviews/mock/start",
+        json={"user_id": "raw-only-user", "target_position": "后端开发工程师", "mode": "project_deep_dive"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["resume_context_used"] is True
+    assert body["anchor_project"]
+    assert "Python" in body["resume_context_summary"]
+
+
+def test_current_resume_reports_missing_when_no_active_profile():
+    store.resume_reports.pop("missing-resume-user", None)
+
+    response = client.get("/resume/current/missing-resume-user")
+
+    assert response.status_code == 200
+    assert response.json()["resume"]["available"] is False
+
+
 def test_audio_analysis_task(tmp_path: Path):
     audio = tmp_path / "interview.wav"
     audio.write_bytes(b"fake wav")
@@ -313,7 +412,8 @@ def test_learning_feed_answer_and_mistakes():
     body = feed.json()
     assert body["questions"]
     assert body["insights"]
-    assert body["rag_status"]["provider"] == "chatanywhere"
+    assert body["rag_status"]["provider"] == "local"
+    assert body["rag_status"]["retrieved"] >= 0
 
     question_id = body["questions"][0]["id"]
     answer = client.post(
@@ -336,7 +436,7 @@ def test_learning_feed_answer_and_mistakes():
     assert "mistakes" in mistakes.json()
 
 
-def test_audio_analysis_deposits_real_interview_question(tmp_path: Path):
+def test_audio_analysis_fallback_keeps_warning_and_sample_without_fake_deposit(tmp_path: Path):
     audio = tmp_path / "interview.wav"
     audio.write_bytes(b"fake wav")
 
@@ -348,7 +448,17 @@ def test_audio_analysis_deposits_real_interview_question(tmp_path: Path):
         )
 
     assert response.status_code == 200
+    task = client.get(f"/tasks/{response.json()['id']}").json()
+    report = review_db.get_review(task["review_report_id"])
+    assert report is not None
+    assert report.segments[0].speaker == "system"
+    assert "期待您的真实录音上传分析" in report.summary
+    for leaked_word in ["预分析", "语音识别", "音频切分", "ffmpeg", "低置信"]:
+        assert leaked_word not in report.summary
+    assert any(segment.speaker == "interviewer" and "请介绍你最有代表性的项目" in segment.text for segment in report.segments)
+    assert report.rag_diagnostics == []
+    assert report.captured_questions == []
+
     questions = client.get("/questions").json()["questions"]
-    real_questions = [item for item in questions if item["source"] == "real_interview"]
-    assert real_questions
-    assert real_questions[-1]["badge"] == "高频实战"
+    fake_titles = [item["title"] for item in questions if item["source"] == "real_interview"]
+    assert not any("请介绍你最有代表性的项目" in title for title in fake_titles)

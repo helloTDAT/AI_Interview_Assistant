@@ -51,8 +51,12 @@ def test_auth_roles_and_review_annotation_flow(tmp_path: Path):
     assert review.status_code == 200
     review_body = review.json()["review"]
     assert review_body["segments"]
-    assert review_body["rag_diagnostics"]
-    assert review_body["captured_questions"]
+    assert review_body["segments"][0]["speaker"] == "system"
+    assert review_body["rag_diagnostics"] == []
+    assert review_body["captured_questions"] == []
+    assert "期待您的真实录音上传分析" in review_body["summary"]
+    for leaked_word in ["预分析", "语音识别", "音频切分", "低置信"]:
+        assert leaked_word not in review_body["summary"]
 
     segment_id = review_body["segments"][0]["id"]
     forbidden = client.post(
@@ -72,7 +76,7 @@ def test_auth_roles_and_review_annotation_flow(tmp_path: Path):
 
     update = client.put(
         f"/reviews/{review_body['id']}/segments/{segment_id}",
-        json={"teacher_score": 88, "speaker": "interviewer"},
+        json={"teacher_score": 88, "speaker": "system"},
         headers={"Authorization": f"Bearer {teacher_token}"},
     )
     assert update.status_code == 200

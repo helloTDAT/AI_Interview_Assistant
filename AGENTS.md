@@ -4,17 +4,18 @@
 
 ## 1. 项目定位
 
-本项目是一个面向大学生就业场景的 Web 应用 MVP。系统以统一对话入口为核心，通过 Router Agent 调度多个子 Agent，为学生提供从简历分析、模拟面试、真实面试录音复盘到个性化练习题生成的全链路辅助。
+本项目是面向大学生就业场景的 Web MVP。系统以统一对话入口为核心，由 Router Agent 调度多个子 Agent，为学生提供从简历分析、模拟面试、真实面试录音复盘到个性化练习题生成的全链路辅助。
 
 核心目标：
 
 - 让用户通过一个对话框完成大部分操作。
-- 支持通过旁侧快捷按钮唤起不同功能 Agent。
+- 支持通过右侧快捷入口唤起不同功能 Agent。
 - 支持 PDF、DOCX、PNG、JPG、JPEG 等多格式简历输入。
 - 支持用户先挂载文件，再在对话框中补充个性化需求，最后才触发分析。
 - 支持岗位分类选择，并让目标岗位真实影响简历分析、模拟面试和练习题推荐。
-- 支持可选 JD 粘贴：不填 JD 也能完整分析；填写 JD 时额外生成具体岗位匹配诊断。
-- 当 OCR 或文本解析置信度较低时，必须明确提示“当前只是预分析”，不能假装已经完整读懂简历。
+- 支持可选 JD 粘贴；不填 JD 也能完整分析，填写 JD 时额外生成具体岗位匹配诊断。
+- 支持录音复盘异步任务流、讲师批注和讲师修正。
+- 支持本地 RAG 检索增强，用于练习推荐、答题反馈和复盘诊断。
 
 ## 2. 技术栈
 
@@ -26,11 +27,10 @@
 - pytest
 - python-docx
 - pypdf
-- httpx
+- Pillow
 - pydub
 - websockets
-- langgraph
-- SQLite
+- LangGraph
 
 前端：
 
@@ -40,14 +40,17 @@
 - Vitest
 - 单页聊天工作台体验，入口为 `frontend/index.html`，业务代码位于 `frontend/src`
 
-当前 AI 能力：
+当前 AI 与检索能力：
 
-- 云端 LLM 统一通过 ChatAnywhere 的 OpenAI 兼容接口调用，默认模型为 `gpt-5-mini`。
-- 学习题生成、答题评分、模拟面试追问、简历结构化分析和 ChatAnywhere embedding 都集中在后端服务层。
-- 能力评估与复盘模块已预留讯飞能力接入：语音听写、Spark X1.5 HTTP 分析和文本向量化；没有密钥或调用失败时必须规则 fallback。
-- 没有 API Key、调用失败、超时、限流或返回格式异常时，必须自动回退到规则分析。
-- OCR 仍是占位 fallback；语音识别已有讯飞客户端封装，但真实连通性依赖后端环境变量。
-- 云端 LLM、OCR、语音识别、多模态、embedding 能力应集中接入 `backend/app/services/ai_clients.py` 或同级 service 文件，不要把供应商调用散落到各个 Agent、路由或前端内。
+- ChatAnywhere OpenAI 兼容接口，默认模型 `gpt-5-mini`。
+- ChatAnywhere 用于题目生成、答题评分、参考答案、模拟面试生成与总结等文本能力。
+- `backend/finetune` 提供轻量 QLoRA/SFT 演示链路，用于构造垂类数据集、训练 LoRA adapter 和评估本地微调模型；默认关闭，不影响主流程。
+- Planner Agent 和 ToolRegistry 用于跨任务规划、工具调用轨迹展示和安全 fallback；不得绕过附件“先挂载、后发送”的产品规则。
+- 讯飞客户端封装在 `backend/app/services/xfyun_clients.py`，覆盖语音听写、Spark X1.5 HTTP 和 Embedding。
+- 音频分片在 `backend/app/services/audio_processing.py`，依赖 `ffmpeg + pydub`。
+- 本地 RAG 在 `backend/app/services/learning_rag.py`，前台默认走 local provider。
+- 没有 API Key、调用失败、超时、限流或返回格式异常时，必须自动回退规则逻辑。
+- 云端 LLM、OCR、语音识别、多模态能力应集中接入 `backend/app/services`，不要把供应商调用散落到 Agent、路由或前端。
 - API Key 只能放在后端 `.env` 或系统环境变量中，严禁写入源码、测试、前端或文档示例的真实值。
 
 ## 3. 目录结构
@@ -75,8 +78,8 @@
 │   │   │   ├── database.py
 │   │   │   └── storage.py
 │   │   ├── services
-│   │   │   ├── audio_processing.py
 │   │   │   ├── ai_clients.py
+│   │   │   ├── audio_processing.py
 │   │   │   ├── learning_rag.py
 │   │   │   ├── resume_parser.py
 │   │   │   └── xfyun_clients.py
@@ -142,9 +145,7 @@ http://127.0.0.1:5173
 
 ## 5. 环境变量
 
-`.env.example` 只放变量名和安全默认值，不允许放真实 Key。
-
-ChatAnywhere 配置：
+`.env.example` 只放变量名和安全默认值，不允许放真实 Key。`.env` 可放在项目根目录或 `backend/.env`。
 
 ```env
 LLM_PROVIDER=chatanywhere
@@ -157,6 +158,7 @@ LLM_MAX_TOKENS=1800
 RAG_VECTOR_DIR=.rag
 
 DATABASE_PATH=interview_assistant.sqlite3
+
 XFYUN_APP_ID=
 XFYUN_API_KEY=
 XFYUN_API_SECRET=
@@ -167,10 +169,6 @@ XFYUN_EMBEDDING_URL=https://emb-cn-huabei-1.xf-yun.com/
 XFYUN_IAT_URL=wss://iat-api.xfyun.cn/v2/iat
 AUDIO_CHUNK_SECONDS=55
 ```
-
-`.env` 可放在项目根目录或 `backend/.env`。`backend/app/core/config.py` 会同时读取这两个位置。
-
-注意：`.env.example` 只能保留空 Key 和安全默认值；任何真实 ChatAnywhere 或讯飞密钥都不得提交。
 
 ## 6. 测试命令
 
@@ -193,17 +191,7 @@ npm run build
 node frontend\smoke-test.mjs
 ```
 
-或直接运行：
-
-```powershell
-npm run smoke:frontend
-```
-
-任何修改 Agent、接口、简历解析、前端交互或报告可视化的 PR 或提交，都应至少通过：
-
-- `.\.venv\Scripts\python.exe -m pytest --basetemp .pytest-tmp`
-- `npm run build`
-- `node frontend\smoke-test.mjs`
+任何修改 Agent、接口、简历解析、RAG、前端交互或报告可视化的提交，都应至少通过以上三条命令。
 
 ## 7. Agent 总体架构
 
@@ -219,10 +207,9 @@ npm run smoke:frontend
 
 - Router Agent 负责理解用户意图和调度，不直接做复杂业务分析。
 - 子 Agent 只负责自己的业务域，避免互相直接依赖。
-- 公共能力放到 `services`，例如 LLM、OCR、语音识别、简历解析。
+- 公共能力放到 `services`，例如 LLM、音频处理、讯飞客户端、简历解析、本地 RAG。
 - 数据模型统一放在 `models.py`。
-- 业务会话和题库仍以 `InMemoryStore` 为主；账号、权限、任务复盘与讲师批注使用 SQLite 持久化。
-- 学习 RAG 和复盘向量化属于服务层能力，不应直接写在路由或前端里。
+- SQLite 用于账号、权限、任务、复盘和批注；`InMemoryStore` 仍保留给部分 MVP 业务数据。
 
 ## 8. Router Agent
 
@@ -273,21 +260,7 @@ backend/app/services/ai_clients.py
 - 可选调用 ChatAnywhere `gpt-5-mini` 生成多维评价。
 - 根据可选 JD 生成具体岗位匹配诊断。
 - 根据用户补充需求生成更聚焦的改进建议。
-
-支持格式：
-
-- `.pdf`
-- `.docx`
-- `.png`
-- `.jpg`
-- `.jpeg`
-
-解析策略：
-
-- PDF：优先文本层抽取；如果文本过少，则进入 OCR fallback。
-- DOCX：直接抽取段落和表格内容。
-- 图片：进入 OCR/multimodal fallback。
-- 不支持格式：返回低置信度和警告。
+- 识别真实经历块，避免把“项目背景”“项目成果”“工作内容”等标题当成项目经历。
 
 接口：
 
@@ -301,40 +274,19 @@ POST /files/resume
 - `user_id`
 - `target_position`
 - `user_instruction`
-- `job_description`：可选，用户粘贴具体岗位 JD 时传入
-
-报告关键字段：
-
-- `quality_score`
-- `dimension_scores`
-- `forbidden_words`
-- `template_similarity_score`
-- `job_fit`
-- `recommendations`
-- `analysis_engine`：`llm`、`rules` 或 `rules_fallback`
-- `llm_error`
-- `jd_diagnosis`
-- `interview_risks`
-- `logic_gaps`
-- `reading_experience`
-- `star_optimizations`
-- `needs_user_confirmation`
+- `job_description`
 
 重要产品原则：
 
 - 上传文件不等于立即分析。前端应先挂载附件，等待用户补充需求后再调用 `/files/resume`。
 - 用户只选择目标岗位，也必须能完成完整分析。
+- 简历分析成功后应成为当前用户的共享简历画像，模拟面试和练习题在未上传新简历前必须复用这份画像。
 - JD 是可选增强能力，不能变成主流程必填项。
-- 当 `parse_confidence < 0.6` 或 `needs_user_confirmation = true` 时，前端必须提示用户当前是预分析。
-- 不能基于 `[OCR待接入]` 这类占位文本输出过度自信结论。
+- 当 `parse_confidence < 0.6` 或 `needs_user_confirmation = true` 时，前端必须提示用户当前结论存在不确定性。
+- 不能基于 OCR 或 fallback 占位文本输出过度自信结论。
 - 用户的 `target_position` 和 `user_instruction` 都必须传入分析接口。
 - 如果 LLM 调用失败，必须自动回退规则分析，不能阻断简历报告生成。
-
-岗位匹配：
-
-- 岗位画像定义在 `ResumeEvaluationAgent.target_skill_map`。
-- 新增岗位时，应补充对应核心技能，并添加测试。
-- AI/算法岗应重点关注 Python、机器学习、深度学习、PyTorch、TensorFlow、算法、SQL 等能力。
+- 动态预警和 STAR 胶囊只应基于具体经历句生成，不应因为孤立标题或泛词出现就判定风险。
 
 ## 10. Mock Interview Agent
 
@@ -344,14 +296,6 @@ POST /files/resume
 backend/app/agents/mock_interview_agent.py
 ```
 
-职责：
-
-- 根据用户目标岗位和已有简历报告生成模拟面试问题。
-- 使用 LangGraph 状态机驱动 8 题标准面试流程：项目暖场、项目基础、项目技术基础、实现细节、项目深挖、岗位/计基、算法、系统设计/行为抗压。
-- 无简历时不得编造项目经历，应改为岗位认知、岗位基础、计算机基础、算法、系统设计、开放题和行为抗压。
-- 每道题最多允许一次动态追问；回答充分后进入下一阶段。
-- 支持用户点击“结束面试”强制中断，并立即生成与完整面试一致结构的 `final_report`。
-
 接口：
 
 ```text
@@ -360,13 +304,32 @@ POST /interviews/mock/message
 POST /interviews/mock/finish
 ```
 
+职责：
+
+- 根据目标岗位和已有简历报告生成完整模拟面试流程。
+- 支持三种模式：`tech_blitz`、`project_deep_dive`、`behavioral`。
+- 默认采用 8 题标准流程，而不是单纯项目深挖。
+- 根据用户回答生成反馈、关键词、压力指标、能力分数和下一阶段。
+- 点击“结束面试”时调用 `/finish` 强制中断，直接生成总结，不再继续追问。
+
+标准 8 题流程：
+
+1. 项目暖场
+2. 项目基础题
+3. 项目技术基础题
+4. 项目实现细节题
+5. 项目深挖题
+6. 岗位/计算机基础题
+7. 算法/编码思维题
+8. 系统设计/行为抗压题
+
 注意：
 
-- 如果用户已经上传过简历，应优先使用简历中的技能点生成问题。
-- 面试题必须锚定真实项目/实习经历，不得把 `【项目背景】`、`项目成果`、`工作内容` 等章节标题当成项目。
-- 模拟面试开始后，前端发送按钮和 Enter 键都应把输入作为面试回答提交到 `/interviews/mock/message`。
-- “结束面试”按钮必须调用 `/interviews/mock/finish`，不得把结束意图当作普通回答发送。
+- 有简历时，先从真实项目或实习经历中选择最适配目标岗位的锚点。
+- 无简历时，不生成任何项目经历假设，只问岗位认知、岗位基础、计算机基础、算法、系统设计、开放问题和行为抗压。
+- 前端发送按钮和 Enter 键都应把输入作为面试回答提交到 `/interviews/mock/message`。
 - 不要让面试中的回答误走 `/chat`。
+- `finished=true` 后不得继续生成新题。
 
 ## 11. Interview Audio Analysis Agent
 
@@ -374,14 +337,9 @@ POST /interviews/mock/finish
 
 ```text
 backend/app/agents/audio_agent.py
+backend/app/services/audio_processing.py
+backend/app/services/xfyun_clients.py
 ```
-
-职责：
-
-- 接收真实面试录音文件。
-- 创建异步任务，进行多格式音频切片、语音转写、角色分离、RAG 漏点诊断、软技能指标、真题捕获和讲师复核。
-- 使用 `ffmpeg + pydub` 处理 MP3/WAV/M4A 等主流格式，部署环境必须安装 `ffmpeg`。
-- 真题捕获后写入题库，并标记 `real_interview` 供练习瀑布流加权推荐。
 
 接口：
 
@@ -394,29 +352,41 @@ POST /reviews/{review_id}/annotations
 PUT /reviews/{review_id}/segments/{segment_id}
 ```
 
-当前实现：
+职责：
 
-- 任务入口使用 FastAPI BackgroundTasks，任务和复盘报告落到 SQLite。
-- 没有 `ffmpeg`、讯飞 Key 或外部服务失败时，必须给出明确错误或 fallback 结果，不能阻塞页面。
-- 讲师批注与分数修正保留 AI 初评，体现“AI 初评 + 人工复核提效”。
+- 接收真实面试录音文件。
+- 创建异步任务，返回任务 ID、进度和阶段。
+- 用 `ffmpeg + pydub` 对 MP3/WAV/M4A 等格式做 16k 单声道分片准备。
+- 封装讯飞语音听写 WebSocket 作为主 ASR 链路。
+- 使用 Spark X1.5 HTTP 做结构化分析。
+- 使用本地 RAG 做知识点诊断和漏点提示。
+- 提取真实面试官问题，去重、打标签并反哺题库。
+- 生成复盘控制室数据，支持讲师批注和讲师修正。
 
-讯飞接入应集中在 `backend/app/services/xfyun_clients.py`；音频分片应集中在 `backend/app/services/audio_processing.py`。
+前端要求：
 
-## 12. Question Generation Agent
+- 上传录音只挂载附件，不立即处理。
+- 用户点击发送后才调用 `/interviews/audio`。
+- 任务队列只在有录音任务时显示，不常驻占据右侧快捷入口。
+- 进入复盘控制室后隐藏普通底部对话框，使用复盘工作台内部交互。
+- 复盘控制室必须支持返回工作台。
+- 讲师登录后必须提供退出入口；退出后清空 token、任务、复盘状态并停止轮询。
+
+数据边界：
+
+- 系统提示段和演示示例内容不得沉淀为真实真题。
+- 示例复盘内容可用于演示，但不能写入 `real_interview` 题库或正式 RAG 诊断。
+- 讲师修正应保留 AI 初评与人工修正的差异。
+
+## 12. Question Generation Agent 与本地 RAG
 
 文件：
 
 ```text
 backend/app/agents/question_agent.py
+backend/app/services/learning_rag.py
+backend/scripts/import_open_source_questions.py
 ```
-
-职责：
-
-- 根据简历技能、目标岗位、真实题库和宝典题生成练习题。
-- 将系统生成题写入题库。
-- 为模拟面试提供候选问题。
-- 提供瀑布流练习 feed、答题评分、错题本和技能树洞察。
-- 支持本地 RAG：合法来源 Markdown 切片、真实面试题和生成题混合检索。
 
 接口：
 
@@ -432,8 +402,28 @@ PUT /questions/{question_id}
 DELETE /questions/{question_id}
 ```
 
-- 导入开源资料时必须使用白名单合法来源，并保存 license、repo、path、source_url。
-- 题目应保留来源：`real_interview`、`handbook`、`generated`。
+职责：
+
+- 根据简历技能、目标岗位、真实题库、本地 RAG 和上一题表现生成练习 feed。
+- 为答题提交生成评分、亮点、改进点和资深工程师参考思路。
+- 维护错题本和技能点亮图谱。
+- 将真实面试题同步沉淀为本地 RAG chunk。
+
+题目模型要求：
+
+- `Question.title` 是短标题，建议 12-60 字，不得塞入完整长题干。
+- `Question.prompt` 存放具体题干和作答要求，最多 1-3 条。
+- `answer_reference` 存放参考思路。
+- `source` 必须能区分 `real_interview`、`handbook`、`generated`、`open_source`。
+
+RAG 规则：
+
+- 默认使用 local provider，不阻塞前台 feed。
+- 本地索引保存到 `.rag/learning_chunks.json`。
+- 每个 chunk 必须保留 `text`、`title`、`repo`、`path`、`license`、`source_url`、`skill_tags`。
+- 合法开源导入必须经过白名单和许可校验。
+- 首次运行空库时允许使用内置种子库。
+- 云 embedding 只能作为后台增强，不得成为前台推荐的硬依赖。
 
 ## 13. 前端交互规范
 
@@ -443,17 +433,10 @@ DELETE /questions/{question_id}
 frontend/src/App.vue
 frontend/src/components/ResumeReportCard.vue
 frontend/src/components/ResumeReportFullscreen.vue
-frontend/src/components/AbilityRadar.vue
-frontend/src/components/JdTopology.vue
-frontend/src/components/ScoreRing.vue
-frontend/src/components/ComplianceBadges.vue
-frontend/src/components/RiskInsightPanel.vue
-frontend/src/components/StarDiffCapsules.vue
 frontend/src/components/HolographicInterviewRoom.vue
 frontend/src/components/LearningPracticeBoard.vue
 frontend/src/components/ReviewControlRoom.vue
 frontend/src/components/TaskQueuePanel.vue
-frontend/src/utils/normalizeResumeReport.js
 frontend/src/styles.css
 ```
 
@@ -461,36 +444,25 @@ frontend/src/styles.css
 
 核心交互：
 
-- 页面中间是聊天流。
-- 底部是统一输入框。
+- 页面中间是主工作区。
+- 普通聊天、简历分析和录音上传使用底部统一输入框。
+- `activeMode === "practice"` 时，统一输入框必须切换为左侧侧滑抽屉，默认收起，只露出亮黄色呼出把手。
+- 练习题模式的输入抽屉必须覆盖在题卡上方，不得推挤瀑布流布局，也不得重新占用底部固定空间。
 - 输入框旁可以挂载简历或录音。
-- 右上角是 Agent 快捷入口，只占据内容所需高度，不应铺满整个右侧下半区。
+- 右上角是 Agent 快捷入口，只占据内容所需高度，不应铺满右侧下半区。
 - 右下角是可选 JD 输入卡片和当前会话状态卡片，用来填补右下操作区空白。
 - 岗位通过分类下拉选择，不要求用户手打。
 - 简历分析完成后，助手回复应渲染可视化报告卡，而不是纯文字长气泡。
 - 报告卡应提供“进入全屏报告”入口。
-- 点击“模拟面试”后应进入全息面试舱专注视图，不继续停留在普通聊天气泡里。
-- 点击“练习题”后应进入瀑布流练习场，支持文字答题和语音占位。
-- 上传录音后应通过异步任务队列卡片/通知展示进度，完成后进入复盘控制室。
-
-当前布局约定：
-
-- 页面整体保持左侧窄导航、中间主工作区、右侧辅助区的稳定结构。
-- `Agent 快捷入口` 位于右侧辅助区上方，视觉上是独立卡片组，不要占满右侧整列高度。
-- `JD 卡片` 和 `当前会话` 位于右下角，宽度应比普通窄卡片更舒展，避免文字过早换行。
-- 底部对话框应在可用主区域内居中，不要贴左；同时要给右下角 JD/会话卡片保留空间。
-- 修改 `frontend/src/styles.css` 时要特别关注 `.composer-console`、`.input-context`、`.side`、`.messages`、`.hero` 的相互影响。
-- 顶部状态胶囊 `Router Agent 待命` 应位于主顶部栏右侧，不放入 Agent 快捷入口标题行。
 
 附件规则：
 
 - 选择简历后，只显示已挂载状态，不得立即调用 `/files/resume`。
-- 已挂载附件必须在输入框附近显示文件名和文件类型，例如 `resume.docx / DOCX 简历`，方便用户确认选中的文件是否正确。
-- 用户点击发送后，如果存在挂载简历，则调用 `/files/resume`，并传入输入框内容作为 `user_instruction`。
 - 选择录音后，只显示已挂载状态，不得立即调用 `/interviews/audio`。
+- 已挂载附件必须在输入框附近显示文件名和文件类型。
 - 用户应能移除已挂载附件并重新选择文件。
-- 用户点击发送后，如果存在挂载录音，则调用 `/interviews/audio`。
-- 任务队列不应常驻挤占右侧 Agent 快捷入口；只有存在录音任务时才显示。
+- 点击“练习题”时，如果存在挂载简历，可以静默调用 `/files/resume` 生成推荐画像，再进入 `/learning/feed`。
+- 进入练习题模式时，输入抽屉默认收起；点击呼出把手后可继续复用原输入框、岗位下拉、附件上传和发送逻辑。
 
 岗位规则：
 
@@ -504,16 +476,12 @@ JD 规则：
 - 不填写 JD 时，报告中的 JD 拓扑区域应说明“基于目标岗位画像评估”。
 - 填写 JD 时，请求必须传 `job_description`，报告应展示 JD 匹配率、命中项、缺失项和拓扑图。
 
-简历可视化报告要求：
+复盘控制室规则：
 
-- 顶部 Overview：综合得分环、模板查重状态、违禁词状态、解析置信度状态。
-- 中部 Visual Charts：ECharts 能力雷达图、ECharts JD 匹配拓扑图。
-- 右侧 Alert & Insights：面试雷区、AI 预测追问、逻辑断层、阅读体验短卡片。
-- 底部 STAR 修改胶囊：Before / After / 优化动作说明三列 diff 风格展示。
-- 不应把完整 JSON 直接甩给普通用户作为主反馈。
-- 低置信度时必须显示“预分析”提示，避免过度确定表达。
-- 动态预警和 STAR 胶囊只能基于具体经历句生成，不能因为孤立的 `项目背景`、`优化`、`提升` 等标题或泛词就判定风险。
-- 全屏报告应避免中部大面积空白，动态预警区可内部滚动，STAR 区应紧跟主分析区。
+- `activeMode === "review"` 时隐藏普通底部对话框。
+- 复盘页面内部承担听录音、看转写、看诊断、讲师批注和修正。
+- 系统提示段应渲染为轻提示卡，不得伪装成面试官提问。
+- 不在 UI 中展示底层故障细节给演示用户。
 
 ## 14. 数据模型
 
@@ -537,17 +505,16 @@ backend/app/models.py
 - `LearningFeedRequest`
 - `LearningAnswerRequest`
 - `TaskRecord`
-- `AbilityReport`
 - `ReviewReport`
-- `ReviewSegment`
+- `TranscriptSegment`
+- `RagDiagnosis`
 - `ReviewAnnotation`
 
 修改模型时：
 
 - 同步更新接口测试。
-- 确认前端 `normalizeResumeReport()` 字段读取没有失效。
+- 确认前端字段读取没有失效。
 - 尽量保持向后兼容。
-- 模拟面试响应必须保留旧字段 `session_id`、`question`、`feedback`、`round_index`、`finished`，新增字段只能向后兼容。
 
 ## 15. 存储策略
 
@@ -555,30 +522,20 @@ backend/app/models.py
 
 ```text
 backend/app/core/storage.py
+backend/app/core/database.py
 ```
 
-当前存储分两层：
+当前存储：
 
-`InMemoryStore` 包括：
+- SQLite：用户、token、任务、复盘、批注。
+- InMemoryStore：简历报告、模拟面试 session、题库、部分能力报告和 RAG runtime cache。
+- `.rag/learning_chunks.json`：本地 RAG 持久化索引。
 
-- `resume_reports`
-- `mock_sessions`
-- `tasks`
-- `questions`
-- `reports`
+约束：
 
-SQLite 持久化包括：
-
-- 用户、角色与 token 会话。
-- 音频任务、复盘报告、逐句转写、RAG 诊断、讲师批注、声学指标和真题捕获。
-
-后续替换数据库时，建议：
-
-- 使用 PostgreSQL 作为主库。
-- 使用 pgvector 或 Qdrant 作为向量检索。
-- 把题库、面试宝典、岗位 JD、真实面试题都纳入 RAG。
-
-不要在 Agent 内直接写数据库细节。应抽象存储层或 repository 层。
+- 不要在 Agent 内直接写复杂数据库细节。
+- 数据库访问应集中在 `core/database.py` 或后续 repository 层。
+- 真实密钥、本地数据库和上传文件不应提交到仓库。
 
 ## 16. 云服务接入约定
 
@@ -587,11 +544,7 @@ SQLite 持久化包括：
 ```text
 backend/app/services/ai_clients.py
 backend/app/services/xfyun_clients.py
-backend/app/services/learning_rag.py
-backend/app/services/audio_processing.py
 ```
-
-所有云 API 接入必须集中在这里或同级 service 文件中。
 
 当前接口：
 
@@ -601,74 +554,47 @@ backend/app/services/audio_processing.py
 - `XfyunSpeechClient`
 - `XfyunSparkClient`
 - `XfyunEmbeddingClient`
-- `AudioChunkingService`
-- `LocalVectorStore`
 
 当前 LLM：
 
 - Provider：ChatAnywhere
 - Base URL：`https://api.chatanywhere.tech/v1`
 - Model：`gpt-5-mini`
-- API：OpenAI-compatible Chat Completions `/chat/completions`
-- Embedding：ChatAnywhere embedding 兼容接口，失败时可走本地 fallback。
-
-当前讯飞能力：
-
-- ASR：讯飞语音听写 WebSocket，主链路用于录音转写。
-- Spark：Spark X1.5 HTTP，模型名默认 `spark-x`。
-- Embedding：讯飞文本向量化，失败时保留本地 fallback。
+- API：OpenAI-compatible `/v1/chat/completions`
 
 禁止：
 
 - 在 `routes.py` 里直接调用云模型。
 - 在前端暴露云服务 API Key。
 - 在 Agent 内到处散落供应商 SDK 调用。
-- 在测试中依赖真实外部 LLM 请求；测试应 mock LLMClient 或传空 Key。
-- 在 `.env.example`、README、测试或前端中提交真实 ChatAnywhere/讯飞 API Key。
-
-云能力替换方向：
-
-- OCR：图片简历、扫描 PDF。
-- LLM：结构化简历抽取、综合分析、模拟面试追问、练习题生成。
-- Speech：真实面试录音转写、说话人分离。
-- RAG：面试宝典、真实题库、岗位 JD、公开答案资料。
+- 在测试中依赖真实外部 LLM、ASR 或 Embedding 请求。
+- 把 `.env` 里的真实 Key 写入 README、AGENTS、测试快照或提交历史。
 
 ## 17. 测试规范
 
-当前测试覆盖：
+当前测试覆盖重点：
 
 - Router Agent 意图识别。
-- DOCX 简历解析。
-- 图片简历 OCR fallback。
-- 简历分析接口。
-- AI 算法岗岗位匹配。
-- LLMClient JSON 调用、无 Key、非 JSON fallback。
-- LLM 简历分析成功与失败规则兜底。
-- 模拟面试 8 题递进流程、追问、反向提问、强制结束与即时总结。
-- 简历标题过滤，避免 `项目背景`、`优化`、`提升` 等孤立词触发项目、动态预警或 STAR 误判。
-- 录音分析任务创建、异步进度、复盘工作台、讲师批注和讯飞 mock。
-- 学习 RAG 导入、瀑布流 feed、答题评分、错题归档和真实题沉淀。
-- SQLite 登录、角色权限、学生隔离、讲师批注和管理员访问。
+- DOCX/PDF/图片简历解析和 fallback。
+- 简历分析接口、岗位画像、JD 可选诊断。
+- LLMClient 成功、无 Key、非 JSON、失败 fallback。
+- 模拟面试 8 题流程、追问、强制结束 `/finish`。
+- 录音分析任务、复盘控制室、讲师批注和讲师修正。
+- 本地 RAG seed、导入、搜索、feed 和真实题沉淀。
 - 前端附件挂载后不立即分析。
-- 前端发送需求后再调用简历分析接口。
 - 前端传递 `target_position`、`user_instruction`、可选 `job_description`。
-- 前端显示已挂载文件的文件名和文件类型。
-- 前端保持右上 Agent 快捷入口、右下 JD/会话卡片、底部输入框居中的布局约定。
-- 前端渲染简历报告卡、得分环、合规 Badge、雷达图容器、JD 拓扑容器、面试雷区、STAR diff。
-- 前端全屏报告打开与关闭。
-- 前端模拟面试中发送按钮走面试回答接口。
-- 前端模拟面试结束按钮走 `/interviews/mock/finish`，结束后展示最终能力图谱并禁用继续答题。
-- 前端任务队列只在录音任务存在时显示，并能进入复盘控制室。
-- 前端练习瀑布流渲染、答题提交和岗位参数传递。
+- 前端练习题短标题、RAG 状态、加载/失败/空态。
+- 前端练习题模式下 Chat Input 左侧抽屉默认收起、可展开，且不遮挡或推挤瀑布流题卡。
+- 前端讲师登录、退出、任务轮询停止。
 
 新增功能必须补测试：
 
 - 新增 Agent：补 Agent 单元测试和 API 测试。
 - 新增接口：补 FastAPI TestClient 测试。
-- 修改前端主流程：补 `frontend/src/__tests__/app.spec.js` 和 `frontend/smoke-test.mjs`。
+- 修改前端主流程：补 `frontend/src/__tests__/app.spec.js` 或 `frontend/smoke-test.mjs`。
 - 修改岗位画像：补至少一个岗位匹配测试。
 - 修改简历解析：补对应格式或 fallback 测试。
-- 修改简历报告字段：补 `normalizeResumeReport()` 或组件渲染测试。
+- 修改题目模型：补短标题、prompt 和前端展示测试。
 
 ## 18. 编码与文案
 
@@ -679,8 +605,10 @@ backend/app/services/audio_processing.py
 - 不要引入乱码中文。
 - 中文文案要面向学生用户，避免过度技术化。
 - 对不确定结果要明确表达不确定性。
-- 不要把调试 JSON 作为最终主回答展示给用户。
+- 不要把完整 JSON 作为最终主反馈展示给用户。
 - LLM 输出中涉及量化成果时，不能伪造简历中不存在的数据；应使用“建议补充/可改写为”的语气。
+- 面试题要可读，避免把长段要求全部塞进标题。
+- 复盘演示文案应自然，但内部不能把示例数据当真实结果沉淀。
 
 推荐语气：
 
@@ -692,27 +620,25 @@ backend/app/services/audio_processing.py
 
 MVP 阶段仍有以下限制：
 
-- OCR 未接入真实云服务。
-- 讯飞 Speech-to-text、Spark 和 Embedding 已封装，但真实效果依赖后端 `.env` 密钥和人工连通性测试。
-- RAG 是本地轻量向量库实现，尚未接入 pgvector、Qdrant 等生产级向量库。
-- 业务会话和部分题库仍是内存，服务重启后会丢失；账号、任务与复盘报告已使用 SQLite。
-- 多格式长音频依赖运行环境安装 `ffmpeg`。
-- 尚未进行真实浏览器 Playwright 视觉回归测试。
+- OCR 和 ASR 已有封装与 fallback，但真实连通性需要本地填写密钥后手动验证。
+- 本地 RAG 是轻量检索增强，不是生产级向量数据库。
+- 部分业务数据仍是内存存储，服务重启后会丢失。
 - ECharts 图表当前在 Vitest 中使用 mock，真实视觉仍需浏览器手动或 E2E 验证。
+- 语音作答按钮仍是 UI 占位，不应宣称已完成真实语音识别。
 
-这些限制不能在用户界面中伪装成已完成能力。需要明确以“待接入”“预分析”“当前解析置信度较低”等方式提示用户。
+这些限制不能在产品说明或演示中伪装成已完成生产级能力。
 
 ## 20. 推荐开发顺序
 
-后续迭代建议按以下顺序推进：
+后续迭代建议：
 
-1. 接入真实 OCR，解决图片简历和扫描 PDF 解析问题。
-2. 强化 LLM 结构化输出校验，提升简历多维报告稳定性。
-3. 引入数据库，替换 InMemoryStore。
-4. 建立题库和面试宝典 RAG。
-5. 接入真实语音识别和说话人分离。
+1. 修复现有源码中可能残留的乱码文案。
+2. 接入并验证真实 OCR。
+3. 接入并验证真实讯飞 ASR 长音频链路。
+4. 将 MVP 内存题库和简历报告迁移到数据库。
+5. 引入可选生产级向量库或重排序能力。
 6. 加入 Playwright 端到端测试和移动端布局测试。
-7. 加入讲师审核后台和题库管理后台。
+7. 加入正式讲师后台和题库管理后台。
 
 ## 21. 修改前检查清单
 
@@ -723,8 +649,15 @@ MVP 阶段仍有以下限制：
 - 是否正确传递 `target_position`？
 - 是否正确传递 `user_instruction`？
 - 如果填写 JD，是否正确传递 `job_description`？
-- 低置信度 OCR 是否被明确提示？
+- 低置信度解析是否被明确提示？
 - 简历报告是否仍以可视化卡片呈现，而不是退回长文本气泡？
+- 模拟面试是否仍遵循 8 题递进流程？
+- 结束面试是否走 `/interviews/mock/finish`？
+- 练习题 `title` 是否保持短标题？
+- 练习题模式下输入框是否仍是左侧抽屉而不是底部遮挡层？
+- RAG 是否保持本地快速 fallback，不阻塞前台？
+- 示例复盘是否没有沉淀为真实真题？
+- 讲师退出后是否清理 token、任务和轮询器？
 - 是否新增或更新了测试？
 - 是否通过后端测试、前端构建和前端冒烟测试？
 - 是否避免把云服务 API Key 写入代码？

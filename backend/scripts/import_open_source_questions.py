@@ -23,7 +23,10 @@ def main() -> None:
         license_name=args.license,
         source_url=args.source_url,
     )
-    print(f"Imported {len(chunks)} chunks from {args.repo}.")
+    print(
+        f"Imported {len(chunks)} chunks from {args.repo} "
+        f"(license={args.license}, source_url={args.source_url or 'n/a'})."
+    )
 
 
 if __name__ == "__main__":

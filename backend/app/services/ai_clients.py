@@ -50,6 +50,7 @@ class LLMClient:
         )
         self.timeout_seconds = timeout_seconds if timeout_seconds is not None else settings.llm_timeout_seconds
         self.max_tokens = max_tokens if max_tokens is not None else settings.llm_max_tokens
+        self.local_adapter = LocalFinetunedLLMAdapter()
 
     def classify_intent(self, message: str) -> str:
         text = message.lower()
@@ -138,6 +139,27 @@ class LLMClient:
         count: int,
         difficulty: str,
     ) -> LLMCallResult:
+        local_result = self.local_adapter.chat_json(
+            task="generate_learning_questions",
+            messages=[
+                {"role": "system", "content": "你是面试题生成 Agent，只返回 JSON。"},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "target_position": target_position,
+                            "skills": skills,
+                            "difficulty": difficulty,
+                            "count": count,
+                            "rag_context": rag_context,
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+        )
+        if local_result.ok:
+            return local_result
         return self.chat_json(
             [
                 {
@@ -145,6 +167,7 @@ class LLMClient:
                     "content": (
                         "你是面向大学生求职的面试题生成 Agent。只返回合法 JSON。"
                         "不要编造用户不存在的经历；可以围绕技能生成可练习的问题。"
+                        "题目标题必须短，不超过60字；详细作答要求放入prompt，最多3条。"
                     ),
                 },
                 {
@@ -161,6 +184,7 @@ class LLMClient:
                                 "questions": [
                                     {
                                         "title": "题目",
+                                        "prompt": "具体题干和作答要求，最多3条",
                                         "answer_reference": "参考回答思路",
                                         "skill_tags": ["技能"],
                                         "difficulty": difficulty,
@@ -176,6 +200,27 @@ class LLMClient:
         )
 
     def evaluate_learning_answer(self, question: Question, answer_text: str, rag_context: list[str]) -> LLMCallResult:
+        local_result = self.local_adapter.chat_json(
+            task="evaluate_learning_answer",
+            messages=[
+                {"role": "system", "content": "你是面试答题评分 Agent，只返回 JSON。"},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "question": question.title,
+                            "answer_reference": question.answer_reference,
+                            "skill_tags": question.skill_tags,
+                            "candidate_answer": answer_text,
+                            "rag_context": rag_context,
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+        )
+        if local_result.ok:
+            return local_result
         return self.chat_json(
             [
                 {
@@ -267,6 +312,15 @@ class LLMClient:
             "known_skills": profile.skills,
             "known_projects": profile.projects,
         }
+        local_result = self.local_adapter.chat_json(
+            task="analyze_resume_report",
+            messages=[
+                {"role": "system", "content": "你是简历评估 Agent，只返回 JSON。"},
+                {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+            ],
+        )
+        if local_result.ok:
+            return local_result
         return self.chat_json(
             [
                 {
@@ -344,3 +398,54 @@ class SpeechClient:
             "面试官：请介绍你最有代表性的项目。\n"
             "学生：我做过一个智能面试助手项目，负责后端 Agent 调度和简历解析。"
         )
+
+
+class LocalFinetunedLLMAdapter:
+    """Optional local LoRA/QLoRA inference adapter, disabled by default."""
+
+    def __init__(self) -> None:
+        self.enabled = settings.enable_local_finetuned_llm
+        self.model_path = settings.local_finetuned_model_path
+        self.adapter_path = settings.local_lora_adapter_path
+        self._pipeline = None
+        self._load_error: str | None = None
+
+    def chat_json(self, *, task: str, messages: list[dict[str, str]]) -> LLMCallResult:
+        if not self.enabled:
+            return LLMCallResult(ok=False, error="local finetuned llm is disabled")
+        if not self.model_path:
+            return LLMCallResult(ok=False, error="local finetuned model path is not configured")
+        pipeline = self._load_pipeline()
+        if pipeline is None:
+            return LLMCallResult(ok=False, error=self._load_error or "local finetuned llm unavailable")
+
+        prompt = self._format_prompt(task, messages)
+        try:
+            output = pipeline(prompt, max_new_tokens=settings.llm_max_tokens, do_sample=False)
+            raw_text = output[0]["generated_text"]
+            content = raw_text[len(prompt) :].strip() if raw_text.startswith(prompt) else raw_text.strip()
+            return LLMCallResult(ok=True, data=LLMClient(api_key="")._parse_json_content(content), raw_text=content)
+        except Exception as exc:  # pragma: no cover - optional GPU/local model path
+            return LLMCallResult(ok=False, error=f"local finetuned llm failed: {exc}")
+
+    def _load_pipeline(self):
+        if self._pipeline is not None:
+            return self._pipeline
+        try:
+            from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+
+            tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
+            model = AutoModelForCausalLM.from_pretrained(self.model_path, device_map="auto", trust_remote_code=True)
+            if self.adapter_path:
+                from peft import PeftModel
+
+                model = PeftModel.from_pretrained(model, self.adapter_path)
+            self._pipeline = pipeline("text-generation", model=model, tokenizer=tokenizer)
+            return self._pipeline
+        except Exception as exc:  # pragma: no cover - optional dependency path
+            self._load_error = f"local finetuned llm load failed: {exc}"
+            return None
+
+    def _format_prompt(self, task: str, messages: list[dict[str, str]]) -> str:
+        body = "\n".join(f"{message['role']}: {message['content']}" for message in messages)
+        return f"任务：{task}\n{body}\nassistant(JSON):"

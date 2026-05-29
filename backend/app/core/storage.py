@@ -1,4 +1,6 @@
-from app.models import AbilityReport, LearningAnswerFeedback, Question, QuestionSource, RagChunk, TaskRecord
+from typing import Any
+
+from app.models import AbilityReport, LearningAnswerFeedback, Question, QuestionSource, RagChunk, ResumeProfile, TaskRecord
 
 
 class InMemoryStore:
@@ -54,3 +56,45 @@ class InMemoryStore:
 
 
 store = InMemoryStore()
+
+
+def get_active_resume_report(user_id: str) -> dict[str, Any] | None:
+    report = store.resume_reports.get(user_id)
+    return report if isinstance(report, dict) else None
+
+
+def get_active_resume_profile(user_id: str) -> ResumeProfile | dict[str, Any] | None:
+    report = get_active_resume_report(user_id)
+    return report.get("profile") if report else None
+
+
+def summarize_active_resume(user_id: str) -> dict[str, Any]:
+    report = get_active_resume_report(user_id)
+    if not report:
+        return {"available": False}
+    profile = report.get("profile") or {}
+    if isinstance(profile, ResumeProfile):
+        skills = profile.skills
+        projects = profile.projects
+        internships = profile.internships
+        confidence = profile.parse_confidence
+        target = profile.target_position
+    else:
+        skills = [str(skill) for skill in profile.get("skills", [])]
+        projects = [str(item) for item in profile.get("projects", [])]
+        internships = [str(item) for item in profile.get("internships", [])]
+        confidence = float(profile.get("parse_confidence") or 0)
+        target = profile.get("target_position")
+    job_fit = report.get("job_fit") or {}
+    target_position = job_fit.get("target_position") or target or "目标岗位未填写"
+    quality_score = report.get("quality_score")
+    return {
+        "available": True,
+        "target_position": target_position,
+        "skills": skills[:8],
+        "project_count": len(projects),
+        "internship_count": len(internships),
+        "parse_confidence": confidence,
+        "quality_score": quality_score,
+        "needs_user_confirmation": bool(report.get("needs_user_confirmation") or confidence < 0.6),
+    }

@@ -1,5 +1,5 @@
 <template>
-  <div class="app-shell" :class="{ 'mock-layout': activeMode === 'mock' }">
+  <div class="app-shell" :class="{ 'mock-layout': activeMode === 'mock', 'review-layout': activeMode === 'review', 'practice-layout': activeMode === 'practice' }">
     <nav class="rail" aria-label="主导航">
       <div class="mark">AI</div>
       <button type="button" class="rail-button" title="新会话" @click="newThread">+</button>
@@ -52,17 +52,33 @@
           v-else-if="activeMode === 'review' && activeReview"
           :review="activeReview"
           @annotate="submitAnnotation"
+          @update-segment="updateReviewSegment"
+          @exit="exitReviewRoom"
         />
 
-        <LearningPracticeBoard
-          v-else-if="activeMode === 'practice'"
-          :questions="practiceQuestions"
-          :insights="practiceInsights"
-          :feedback-by-id="answerFeedback"
-          :target-position="targetPosition"
-          @submit-answer="submitPracticeAnswer"
-          @voice-placeholder="showVoicePlaceholder"
-        />
+        <div v-else-if="activeMode === 'practice'" class="practice-stack">
+          <section v-if="plannerTrace.length" class="planner-trace-card" data-testid="planner-trace">
+            <strong>{{ plannerPlanSummary }}</strong>
+            <div class="planner-trace-list">
+              <span v-for="trace in plannerTrace" :key="`${trace.tool_name}-${trace.summary}`" :class="trace.status">
+                {{ trace.tool_name }} · {{ trace.summary }}
+              </span>
+            </div>
+          </section>
+          <LearningPracticeBoard
+            :questions="practiceQuestions"
+            :insights="practiceInsights"
+            :feedback-by-id="answerFeedback"
+            :target-position="targetPosition"
+            :feed-source="practiceFeedSource"
+            :rag-status="practiceRagStatus"
+            :loading="practiceLoading"
+            :error="practiceError"
+            @submit-answer="submitPracticeAnswer"
+            @voice-placeholder="showVoicePlaceholder"
+            @retry="loadPracticeFeed"
+          />
+        </div>
 
         <template v-else>
           <section v-if="messages.length === 0" class="hero">
@@ -96,6 +112,11 @@
               </template>
               <template v-else>
                 <div class="bubble">{{ messageItem.text }}</div>
+                <div v-if="messageItem.traces?.length" class="planner-trace-inline" data-testid="planner-trace">
+                  <span v-for="trace in messageItem.traces" :key="`${trace.tool_name}-${trace.summary}`">
+                    {{ trace.tool_name }} · {{ trace.summary }}
+                  </span>
+                </div>
                 <div v-if="messageItem.meta" class="meta">{{ messageItem.meta }}</div>
               </template>
             </article>
@@ -103,7 +124,24 @@
         </template>
       </section>
 
-      <footer v-if="activeMode !== 'mock'" class="composer-wrap">
+      <button
+        v-if="activeMode === 'practice'"
+        type="button"
+        class="practice-drawer-tab"
+        :class="{ open: isPracticeComposerOpen }"
+        :aria-expanded="isPracticeComposerOpen ? 'true' : 'false'"
+        aria-controls="main-composer"
+        @click="isPracticeComposerOpen = !isPracticeComposerOpen"
+      >
+        <span>{{ isPracticeComposerOpen ? "收起" : "对话" }}</span>
+      </button>
+
+      <footer
+        v-if="activeMode !== 'mock' && activeMode !== 'review'"
+        id="main-composer"
+        class="composer-wrap"
+        :class="{ 'practice-drawer': activeMode === 'practice', open: isPracticeComposerOpen, closed: activeMode === 'practice' && !isPracticeComposerOpen }"
+      >
         <div class="composer-console">
           <div class="composer">
             <div class="target-row">
@@ -167,9 +205,11 @@
     <aside v-if="activeMode !== 'mock'" class="side">
       <div class="side-title-row">
         <h2>Agent 快捷入口</h2>
-        <button type="button" class="teacher-chip" @click="loginAsTeacher">
-          {{ currentUser ? currentUser.display_name : "讲师登录" }}
-        </button>
+        <div v-if="currentUser" class="teacher-session" data-testid="teacher-session">
+          <span>{{ currentUser.display_name }}</span>
+          <button type="button" class="teacher-logout" @click="logoutTeacher">退出</button>
+        </div>
+        <button v-else type="button" class="teacher-chip" @click="loginAsTeacher">讲师登录</button>
       </div>
       <div class="agent-list">
         <button type="button" @click="quickPrompt('请帮我分析简历，我会上传 PDF、DOCX 或图片简历。')">
@@ -229,10 +269,18 @@ const messagesRef = ref(null);
 const resumeInput = ref(null);
 const audioInput = ref(null);
 const activeMode = ref("chat");
+const isPracticeComposerOpen = ref(false);
 const practiceQuestions = ref([]);
 const practiceInsights = ref([]);
+const practiceFeedSource = ref("target");
+const practiceRagStatus = ref(null);
+const practiceLoading = ref(false);
+const practiceError = ref("");
 const answerFeedback = ref({});
 const lastPracticeScore = ref(null);
+const plannerTrace = ref([]);
+const plannerPlanSummary = ref("");
+const activeResumeSummary = ref(null);
 const authToken = ref("");
 const currentUser = ref(null);
 const tasks = ref([]);
@@ -279,13 +327,15 @@ const attachmentInfo = computed(() => {
   return null;
 });
 
-const addMessage = (role, text, meta = "") => {
+const addMessage = (role, text, meta = "", extra = {}) => {
+  isPracticeComposerOpen.value = false;
   activeMode.value = "chat";
-  messages.value.push({ id: crypto.randomUUID(), type: "text", role, text, meta });
+  messages.value.push({ id: crypto.randomUUID(), type: "text", role, text, meta, ...extra });
   scrollToBottom();
 };
 
 const addResumeReport = (report) => {
+  isPracticeComposerOpen.value = false;
   activeMode.value = "chat";
   messages.value.push({ id: crypto.randomUUID(), type: "resume-report", role: "assistant", report });
   scrollToBottom();
@@ -311,6 +361,8 @@ const responseToTurn = (data) => ({
   question_type: data.question_type || "project",
   phase_label: data.phase_label || "",
   anchor_project: data.anchor_project || "",
+  resume_context_used: data.resume_context_used || false,
+  resume_context_summary: data.resume_context_summary || "",
   difficulty_level: data.difficulty_level || "",
   question_intent: data.question_intent || "",
   probing_reason: data.probing_reason || "",
@@ -337,7 +389,31 @@ const loginAsTeacher = async () => {
   startTaskPolling();
 };
 
+const logoutTeacher = async () => {
+  const headers = authHeaders();
+  try {
+    await fetch(`${API}/auth/logout`, {
+      method: "POST",
+      headers,
+    });
+  } finally {
+    stopTaskPolling();
+    authToken.value = "";
+    currentUser.value = null;
+    tasks.value = [];
+    activeReview.value = null;
+    completedNotice.value = null;
+    if (activeMode.value === "review") {
+      isPracticeComposerOpen.value = false;
+      activeMode.value = "chat";
+    }
+    sessionInfo.value = "讲师已退出，当前为普通工作台。";
+    setBusy("讲师已退出");
+  }
+};
+
 const quickPrompt = async (text) => {
+  isPracticeComposerOpen.value = false;
   activeMode.value = "chat";
   composerText.value = text;
   await sendChat();
@@ -400,12 +476,20 @@ const newThread = () => {
   fullscreenReport.value = null;
   pendingResumeFile.value = null;
   pendingAudioFile.value = null;
+  isPracticeComposerOpen.value = false;
   activeMode.value = "chat";
   activeReview.value = null;
   completedNotice.value = null;
   mockTranscript.value = [];
   mockCurrentTurn.value = null;
   mockDraft.value = "";
+  practiceFeedSource.value = "target";
+  practiceRagStatus.value = null;
+  activeResumeSummary.value = null;
+  practiceLoading.value = false;
+  practiceError.value = "";
+  plannerTrace.value = [];
+  plannerPlanSummary.value = "";
   if (resumeInput.value) resumeInput.value.value = "";
   if (audioInput.value) audioInput.value.value = "";
   setBusy("Router Agent 待命");
@@ -425,12 +509,17 @@ const sendChat = async () => {
     });
     const data = await response.json();
     setBusy(`${data.intent || "Agent"} 已响应`);
+    if (data.intent === "agent_plan") {
+      applyPlannerResponse(data);
+      return;
+    }
     if (data.intent === "mock_interview") {
       await startMock();
       return;
     }
     if (data.intent === "learning_resource" && data.data?.questions) {
       practiceQuestions.value = data.data.questions;
+      isPracticeComposerOpen.value = false;
       activeMode.value = "practice";
       await loadPracticeFeed();
       return;
@@ -442,6 +531,24 @@ const sendChat = async () => {
   }
 };
 
+const applyPlannerResponse = (data) => {
+  const payload = data.data || {};
+  plannerTrace.value = payload.traces || [];
+  plannerPlanSummary.value = data.message || payload.final_message || "Agent 已完成规划。";
+  if (payload.questions?.length) {
+    practiceQuestions.value = payload.questions;
+    practiceInsights.value = payload.insights || [];
+    practiceRagStatus.value = payload.rag_status || null;
+    practiceFeedSource.value = "planner";
+    isPracticeComposerOpen.value = false;
+    activeMode.value = "practice";
+    sessionInfo.value = plannerPlanSummary.value;
+    setBusy("Planner Agent 已完成工具编排");
+    return;
+  }
+  addMessage("assistant", plannerPlanSummary.value, "agent-plan", { traces: plannerTrace.value });
+};
+
 const uploadResume = async (userInstruction = "") => {
   const file = pendingResumeFile.value;
   if (!file) return;
@@ -449,6 +556,7 @@ const uploadResume = async (userInstruction = "") => {
   setBusy("Resume Evaluation Agent 正在分析");
   const form = new FormData();
   form.append("file", file);
+  form.append("user_id", "demo-user");
   form.append("target_position", targetPosition.value);
   form.append("user_instruction", userInstruction);
   if (jobDescription.value.trim()) form.append("job_description", jobDescription.value.trim());
@@ -456,7 +564,8 @@ const uploadResume = async (userInstruction = "") => {
     const response = await fetch(`${API}/files/resume`, { method: "POST", body: form });
     const data = await response.json();
     setBusy("Resume Evaluation Agent 已完成");
-    sessionInfo.value = `目标岗位：${data.job_fit?.target_position || targetPosition.value}；综合评分：${data.quality_score}`;
+    activeResumeSummary.value = summarizeResumeReport(data);
+    sessionInfo.value = `已缓存简历画像：${activeResumeSummary.value.label}`;
     addResumeReport(data);
   } catch {
     setBusy("简历分析失败");
@@ -519,6 +628,7 @@ const openReviewFromTask = async (task) => {
   const response = await fetch(`${API}/reviews/${task.review_report_id}`, { headers: authHeaders() });
   const data = await response.json();
   activeReview.value = data.review;
+  isPracticeComposerOpen.value = false;
   activeMode.value = "review";
   if (completedNotice.value?.task?.id === task.id) completedNotice.value = null;
   setBusy("复盘控制室已打开");
@@ -550,7 +660,30 @@ const submitAnnotation = async (payload) => {
   setBusy("讲师批注已保存");
 };
 
+const updateReviewSegment = async ({ segment_id, updates }) => {
+  if (!activeReview.value || !segment_id) return;
+  const response = await fetch(`${API}/reviews/${activeReview.value.id}/segments/${segment_id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify(updates),
+  });
+  const data = await response.json();
+  activeReview.value = {
+    ...activeReview.value,
+    segments: (activeReview.value.segments || []).map((segment) => (segment.id === segment_id ? data.segment : segment)),
+  };
+  setBusy("讲师修正已保存");
+};
+
+const exitReviewRoom = () => {
+  isPracticeComposerOpen.value = false;
+  activeMode.value = "chat";
+  activeReview.value = null;
+  setBusy("Router Agent 待命");
+};
+
 const startMock = async () => {
+  isPracticeComposerOpen.value = false;
   activeMode.value = "mock";
   setBusy("Mock Interview Agent 正在准备面试舱");
   try {
@@ -563,7 +696,9 @@ const startMock = async () => {
     sessionId.value = data.session_id;
     mockCurrentTurn.value = responseToTurn(data);
     mockTranscript.value = [{ id: crypto.randomUUID(), role: "assistant", text: data.question }];
-    sessionInfo.value = `沉浸式模拟面试进行中：${targetPosition.value}`;
+    sessionInfo.value = data.resume_context_used
+      ? `沉浸式模拟面试进行中：已复用简历画像。${data.resume_context_summary || ""}`
+      : `沉浸式模拟面试进行中：${targetPosition.value}`;
     setBusy("Mock Interview Agent 面试中");
   } catch {
     setBusy("模拟面试启动失败");
@@ -590,6 +725,7 @@ const sendMockDraft = async () => {
 
 const finishMock = async () => {
   if (!sessionId.value) {
+    isPracticeComposerOpen.value = false;
     activeMode.value = "chat";
     return;
   }
@@ -612,6 +748,7 @@ const finishMock = async () => {
 };
 
 const exitMockRoom = () => {
+  isPracticeComposerOpen.value = false;
   activeMode.value = "chat";
   setBusy("Router Agent 待命");
 };
@@ -621,22 +758,103 @@ const showMockMicPlaceholder = (pressed) => {
   setBusy(pressed ? "麦克风为 UI 占位，真实语音识别待接入" : "Mock Interview Agent 面试中");
 };
 
+const preparePracticeProfileFromMountedResume = async () => {
+  const file = pendingResumeFile.value;
+  if (!file) return true;
+  setBusy("Resume Evaluation Agent 正在生成练习推荐画像");
+  const form = new FormData();
+  form.append("file", file);
+  form.append("user_id", "demo-user");
+  form.append("target_position", targetPosition.value);
+  form.append("user_instruction", "请基于这份简历生成个性化练习题推荐画像。");
+  if (jobDescription.value.trim()) form.append("job_description", jobDescription.value.trim());
+  try {
+    const response = await fetch(`${API}/files/resume`, { method: "POST", body: form });
+    if (response.ok === false) throw new Error("resume analysis failed");
+    const data = await response.json();
+    const skills = data.profile?.skills?.slice(0, 4).join("、");
+    activeResumeSummary.value = summarizeResumeReport(data);
+    sessionInfo.value = skills ? `练习推荐已读取简历画像：${skills}` : `练习推荐已读取目标岗位画像：${targetPosition.value}`;
+    pendingResumeFile.value = null;
+    if (resumeInput.value) resumeInput.value.value = "";
+    return true;
+  } catch {
+    setBusy("简历分析失败，练习推荐未生成");
+    sessionInfo.value = "简历画像生成失败。已保留挂载文件，请稍后重试或点击发送生成简历报告。";
+    return false;
+  }
+};
+
 const openPracticeFeed = async () => {
+  if (pendingResumeFile.value) {
+    const prepared = await preparePracticeProfileFromMountedResume();
+    if (!prepared) return;
+    practiceFeedSource.value = "mounted_resume";
+  } else if (activeResumeSummary.value) {
+    practiceFeedSource.value = "active_resume";
+  } else {
+    practiceFeedSource.value = "target";
+  }
   setBusy("Question Generation Agent 正在推荐");
+  isPracticeComposerOpen.value = false;
   activeMode.value = "practice";
   await loadPracticeFeed();
 };
 
 const loadPracticeFeed = async () => {
-  const response = await fetch(`${API}/learning/feed`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ user_id: "demo-user", target_position: targetPosition.value, limit: 8, last_answer_score: lastPracticeScore.value }),
+  practiceLoading.value = true;
+  practiceError.value = "";
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch(`${API}/learning/feed`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({ user_id: "demo-user", target_position: targetPosition.value, limit: 8, last_answer_score: lastPracticeScore.value }),
+    });
+    if (response.ok === false) throw new Error("learning feed failed");
+    const data = await response.json();
+    practiceQuestions.value = data.questions || [];
+    practiceInsights.value = data.insights || [];
+    practiceRagStatus.value = data.rag_status || null;
+    if (data.profile_used && data.profile_summary) {
+      activeResumeSummary.value = summarizeResumeSummary(data.profile_summary);
+      practiceFeedSource.value = practiceFeedSource.value === "mounted_resume" ? "mounted_resume" : "active_resume";
+      sessionInfo.value = `练习题已复用简历画像：${activeResumeSummary.value.label}`;
+    }
+    setBusy(practiceQuestions.value.length ? "Question Generation Agent 已生成练习场" : "Question Generation Agent 暂无推荐题");
+  } catch {
+    practiceError.value = "练习推荐失败，请稍后重试。";
+    practiceQuestions.value = [];
+    practiceRagStatus.value = null;
+    setBusy("练习推荐失败");
+  } finally {
+    window.clearTimeout(timeout);
+    practiceLoading.value = false;
+  }
+};
+
+const summarizeResumeReport = (report) =>
+  summarizeResumeSummary({
+    available: true,
+    target_position: report.job_fit?.target_position || report.profile?.target_position || targetPosition.value,
+    skills: report.profile?.skills || [],
+    project_count: report.profile?.projects?.length || 0,
+    internship_count: report.profile?.internships?.length || 0,
+    parse_confidence: report.profile?.parse_confidence || 0,
+    quality_score: report.quality_score,
+    needs_user_confirmation: report.needs_user_confirmation,
   });
-  const data = await response.json();
-  practiceQuestions.value = data.questions || [];
-  practiceInsights.value = data.insights || [];
-  setBusy("Question Generation Agent 已生成练习场");
+
+const summarizeResumeSummary = (summary) => {
+  const skills = (summary.skills || []).slice(0, 4);
+  const skillText = skills.length ? skills.join("、") : "暂无明确技能";
+  const caution = summary.needs_user_confirmation ? "（低置信度）" : "";
+  return {
+    ...summary,
+    label: `${summary.target_position || targetPosition.value} / ${skillText}${caution}`,
+  };
 };
 
 const submitPracticeAnswer = async (question, answerText) => {

@@ -27,7 +27,8 @@ const feedPayload = {
   questions: [
     {
       id: "q1",
-      title: "请介绍你如何使用 PyTorch 解决实际问题。",
+      title: "PyTorch 训练效果怎么排查？",
+      prompt: "请从数据、模型、损失函数和评估指标中选择两项说明排查路径。",
       answer_reference: "说明场景、模型、训练、评估和结果。",
       source: "generated",
       position: "AI算法工程师",
@@ -37,7 +38,38 @@ const feedPayload = {
     },
   ],
   insights: [{ skill: "PyTorch", mastery: 20, attempts: 0, status: "locked" }],
-  rag_status: { chunks: 4, provider: "chatanywhere" },
+  rag_status: {
+    chunks: 4,
+    provider: "local",
+    retrieved: 2,
+    sources: [{ title: "Redis 缓存", repo: "internal/local-rag-seed", license: "internal" }],
+  },
+  profile_used: true,
+  profile_summary: {
+    available: true,
+    target_position: "AI算法工程师",
+    skills: ["Python", "PyTorch"],
+    project_count: 1,
+    internship_count: 0,
+    parse_confidence: 0.9,
+    quality_score: 86,
+    needs_user_confirmation: false,
+  },
+};
+
+const plannerChatPayload = {
+  intent: "agent_plan",
+  message: "Agent 已规划 5 步，已完成 5 步。已生成 1 道练习题，可直接进入练习。",
+  data: {
+    traces: [
+      { tool_name: "classify_intent", status: "completed", summary: "识别到意图：learning_resource。" },
+      { tool_name: "get_resume_profile", status: "completed", summary: "已读取简历画像，技能线索 2 项。" },
+      { tool_name: "generate_learning_feed", status: "completed", summary: "已生成 1 道练习题推荐。" },
+    ],
+    questions: feedPayload.questions,
+    insights: feedPayload.insights,
+    rag_status: feedPayload.rag_status,
+  },
 };
 
 const reviewPayload = {
@@ -48,6 +80,14 @@ const reviewPayload = {
   summary: "系统已完成逐句转写和 RAG 漏点诊断。",
   dimension_scores: { 准确度: 82, 流畅度: 76, 自信度: 70 },
   segments: [
+    {
+      id: "seg-system",
+      speaker: "system",
+      text: "复盘控制室已准备就绪，期待您的真实录音上传分析。",
+      start_ms: 0,
+      end_ms: 1500,
+      confidence: 0.45,
+    },
     {
       id: "seg-1",
       speaker: "interviewer",
@@ -85,6 +125,9 @@ const mockStartPayload = {
   state: "Greeting",
   mode: "project_deep_dive",
   question_type: "project",
+  anchor_project: "模型训练：负责 PyTorch 训练和效果评估。",
+  resume_context_used: true,
+  resume_context_summary: "已读取简历画像，1 个项目 / 0 段实习，技能：Python、PyTorch",
   pressure_level: 38,
   answer_depth_score: 0,
   skill_scores: { 专业深度: 50, 项目表达: 50, 临场应变: 50 },
@@ -132,36 +175,54 @@ const mockFinishPayload = {
 };
 
 const okResponse = (payload) => ({ json: vi.fn(async () => payload) });
+let resumeUploadShouldFail = false;
+let feedShouldFail = false;
+let feedPayloadOverride = null;
 
 describe("App workflows", () => {
   let taskPollCount;
 
   beforeEach(() => {
     taskPollCount = 0;
+    resumeUploadShouldFail = false;
+    feedShouldFail = false;
+    feedPayloadOverride = null;
     vi.useFakeTimers();
     vi.stubGlobal("crypto", { randomUUID: vi.fn(() => Math.random().toString(16).slice(2)) });
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (url) => {
+      vi.fn(async (url, options = {}) => {
         if (url.endsWith("/auth/login")) return okResponse({ token: "teacher-token", user: { id: "teacher-demo", username: "teacher", role: "teacher", display_name: "讲师 Demo" } });
+        if (url.endsWith("/auth/logout")) return okResponse({ ok: true });
         if (url.endsWith("/tasks")) {
           taskPollCount += 1;
           if (taskPollCount <= 1) return okResponse({ tasks: [] });
           if (taskPollCount === 2) return okResponse({ tasks: [{ id: "task-1", status: "running", stage: "transcribing", progress: 50, message: "正在转写", review_report_id: null }] });
           return okResponse({ tasks: [{ id: "task-1", status: "completed", stage: "ready_for_review", progress: 100, message: "录音复盘完成。", review_report_id: "review-1" }] });
         }
-        if (url.endsWith("/chat")) return okResponse({ intent: "general_chat", message: "你好，我可以帮你分析简历。" });
-        if (url.endsWith("/files/resume")) return okResponse(resumeReport);
+        if (url.endsWith("/chat")) {
+          const body = options.body ? JSON.parse(options.body) : {};
+          if (body.message?.includes("规划")) return okResponse(plannerChatPayload);
+          return okResponse({ intent: "general_chat", message: "你好，我可以帮你分析简历。" });
+        }
+        if (url.endsWith("/files/resume")) {
+          if (resumeUploadShouldFail) throw new Error("resume failed");
+          return okResponse(resumeReport);
+        }
         if (url.endsWith("/interviews/mock/start")) return okResponse(mockStartPayload);
         if (url.endsWith("/interviews/mock/message")) return okResponse(mockMessagePayload);
         if (url.endsWith("/interviews/mock/finish")) return okResponse(mockFinishPayload);
-        if (url.endsWith("/learning/feed")) return okResponse(feedPayload);
+        if (url.endsWith("/learning/feed")) {
+          if (feedShouldFail) throw new Error("feed failed");
+          return okResponse(feedPayloadOverride || feedPayload);
+        }
         if (url.endsWith("/learning/answers")) {
           return okResponse({ feedback: { question_id: "q1", score: 72, passed: true, highlights: ["覆盖了技术点"], improvements: ["补充结果指标"], senior_answer: "说明方案取舍。", next_difficulty: "medium", source: "rules" } });
         }
         if (url.endsWith("/interviews/audio")) return okResponse({ id: "task-1", status: "running", stage: "queued", progress: 10, message: "录音已接收。", review_report_id: null });
         if (url.endsWith("/reviews/review-1")) return okResponse({ review: reviewPayload });
         if (url.endsWith("/reviews/review-1/annotations")) return okResponse({ annotation: { id: "ann-1", review_id: "review-1", segment_id: "seg-1", author_name: "讲师 Demo", body: "补充条件装配。", created_at: "now" } });
+        if (url.endsWith("/reviews/review-1/segments/seg-1")) return okResponse({ segment: { ...reviewPayload.segments[1], teacher_score: 88, speaker: "interviewer" } });
         throw new Error(`unexpected url: ${url}`);
       }),
     );
@@ -188,6 +249,65 @@ describe("App workflows", () => {
 
     expect(fetch.mock.calls.find(([url]) => url.endsWith("/files/resume"))).toBeTruthy();
     expect(wrapper.find('[data-testid="resume-report-card"]').exists()).toBe(true);
+  });
+
+  it("reuses analyzed resume when starting mock interview without another upload", async () => {
+    const wrapper = mount(App, { attachTo: document.body });
+    const resumeInput = wrapper.find('input[accept=".pdf,.docx,.png,.jpg,.jpeg"]');
+    Object.defineProperty(resumeInput.element, "files", {
+      value: [new File(["demo"], "resume.docx", { type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" })],
+      configurable: true,
+    });
+
+    await resumeInput.trigger("change");
+    await wrapper.find("textarea[placeholder]").setValue("请先分析这份简历。");
+    await wrapper.find(".send").trigger("click");
+    await flushPromises();
+    const uploadCallsBeforeMock = fetch.mock.calls.filter(([url]) => url.endsWith("/files/resume")).length;
+
+    const mockButton = wrapper.findAll(".mini-button").find((button) => button.text() === "模拟面试");
+    await mockButton.trigger("click");
+    await flushPromises();
+
+    expect(fetch.mock.calls.filter(([url]) => url.endsWith("/files/resume")).length).toBe(uploadCallsBeforeMock);
+    expect(fetch.mock.calls.find(([url]) => url.endsWith("/interviews/mock/start"))).toBeTruthy();
+    expect(wrapper.find('[data-testid="interview-room"]').text()).toContain("锚定经历");
+  });
+
+  it("reuses analyzed resume for practice feed without reuploading", async () => {
+    const wrapper = mount(App, { attachTo: document.body });
+    const resumeInput = wrapper.find('input[accept=".pdf,.docx,.png,.jpg,.jpeg"]');
+    Object.defineProperty(resumeInput.element, "files", {
+      value: [new File(["demo"], "resume.docx", { type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" })],
+      configurable: true,
+    });
+
+    await resumeInput.trigger("change");
+    await wrapper.find("textarea[placeholder]").setValue("请先分析这份简历。");
+    await wrapper.find(".send").trigger("click");
+    await flushPromises();
+    const uploadCallsBeforePractice = fetch.mock.calls.filter(([url]) => url.endsWith("/files/resume")).length;
+
+    const practiceButton = wrapper.findAll(".mini-button").find((button) => button.text() === "练习题");
+    await practiceButton.trigger("click");
+    await flushPromises();
+
+    expect(fetch.mock.calls.filter(([url]) => url.endsWith("/files/resume")).length).toBe(uploadCallsBeforePractice);
+    expect(fetch.mock.calls.find(([url]) => url.endsWith("/learning/feed"))).toBeTruthy();
+    expect(wrapper.find('[data-testid="practice-board"]').text()).toContain("已基于上次简历画像");
+  });
+
+  it("renders planner trace from chat and keeps generated questions on practice board", async () => {
+    const wrapper = mount(App);
+
+    await wrapper.find("textarea[placeholder]").setValue("请根据我的简历规划 AI 面试练习计划");
+    await wrapper.find(".send").trigger("click");
+    await flushPromises();
+
+    expect(fetch.mock.calls.find(([url]) => url.endsWith("/chat"))).toBeTruthy();
+    expect(wrapper.classes()).toContain("practice-layout");
+    expect(wrapper.find('[data-testid="planner-trace"]').text()).toContain("generate_learning_feed");
+    expect(wrapper.find('[data-testid="practice-board"]').text()).toContain("PyTorch 训练效果怎么排查？");
   });
 
   it("opens holographic mock room and sends answers to mock endpoint with mode", async () => {
@@ -256,6 +376,21 @@ describe("App workflows", () => {
     await flushPromises();
 
     expect(wrapper.find('[data-testid="practice-board"]').exists()).toBe(true);
+    expect(wrapper.classes()).toContain("practice-layout");
+    expect(wrapper.find(".composer-wrap").classes()).toContain("practice-drawer");
+    expect(wrapper.find(".composer-wrap").classes()).toContain("closed");
+    expect(wrapper.find(".practice-drawer-tab").exists()).toBe(true);
+    expect(wrapper.find(".practice-drawer-tab").attributes("aria-expanded")).toBe("false");
+    await wrapper.find(".practice-drawer-tab").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".composer-wrap").classes()).toContain("open");
+    expect(wrapper.find(".practice-drawer-tab").attributes("aria-expanded")).toBe("true");
+    expect(wrapper.find(".practice-drawer .target-row").exists()).toBe(true);
+    expect(wrapper.find(".practice-drawer textarea[placeholder]").exists()).toBe(true);
+    expect(wrapper.find(".practice-drawer .send").exists()).toBe(true);
+    expect(wrapper.find('[data-testid="practice-board"]').text()).toContain("本地 RAG 已命中 2 条知识片段");
+    expect(wrapper.find(".qa-card h3").text()).toBe("PyTorch 训练效果怎么排查？");
+    expect(wrapper.find(".question-prompt").text()).toContain("数据、模型");
     await wrapper.find(".qa-card textarea").setValue("我使用 PyTorch 训练并评估模型。");
     await wrapper.find(".qa-card .send").trigger("click");
     await flushPromises();
@@ -263,6 +398,69 @@ describe("App workflows", () => {
     const answerCall = fetch.mock.calls.find(([url]) => url.endsWith("/learning/answers"));
     expect(JSON.parse(answerCall[1].body).target_position).toBe("AI算法工程师");
     expect(wrapper.find('[data-testid="answer-feedback"]').text()).toContain("72");
+  });
+
+  it("builds practice profile from mounted resume before opening feed", async () => {
+    const wrapper = mount(App);
+    const resumeInput = wrapper.find('input[accept=".pdf,.docx,.png,.jpg,.jpeg"]');
+    Object.defineProperty(resumeInput.element, "files", {
+      value: [new File(["demo"], "resume.docx", { type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" })],
+      configurable: true,
+    });
+    await resumeInput.trigger("change");
+
+    const practiceButton = wrapper.findAll(".mini-button").find((button) => button.text() === "练习题");
+    await practiceButton.trigger("click");
+    await flushPromises();
+
+    const resumeIndex = fetch.mock.calls.findIndex(([url]) => url.endsWith("/files/resume"));
+    const feedIndex = fetch.mock.calls.findIndex(([url]) => url.endsWith("/learning/feed"));
+    expect(resumeIndex).toBeGreaterThan(-1);
+    expect(feedIndex).toBeGreaterThan(resumeIndex);
+    expect(wrapper.find('[data-testid="mounted-file"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="practice-board"]').text()).toContain("已基于当前简历");
+  });
+
+  it("keeps mounted resume and does not open fake personalized practice when resume profiling fails", async () => {
+    resumeUploadShouldFail = true;
+    const wrapper = mount(App);
+    const resumeInput = wrapper.find('input[accept=".pdf,.docx,.png,.jpg,.jpeg"]');
+    Object.defineProperty(resumeInput.element, "files", {
+      value: [new File(["demo"], "resume.docx", { type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" })],
+      configurable: true,
+    });
+    await resumeInput.trigger("change");
+
+    const practiceButton = wrapper.findAll(".mini-button").find((button) => button.text() === "练习题");
+    await practiceButton.trigger("click");
+    await flushPromises();
+
+    expect(fetch.mock.calls.find(([url]) => url.endsWith("/learning/feed"))).toBeFalsy();
+    expect(wrapper.find('[data-testid="mounted-file"]').text()).toContain("resume.docx");
+    expect(wrapper.find('[data-testid="practice-board"]').exists()).toBe(false);
+  });
+
+  it("shows practice feed error state instead of staying in recommending status", async () => {
+    feedShouldFail = true;
+    const wrapper = mount(App);
+    const practiceButton = wrapper.findAll(".mini-button").find((button) => button.text() === "练习题");
+    await practiceButton.trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find('[data-testid="practice-board"]').text()).toContain("练习推荐没有生成成功");
+    expect(wrapper.find('[data-testid="practice-board"]').text()).toContain("练习推荐失败，请稍后重试。");
+    expect(wrapper.find(".status-pill").text()).toContain("练习推荐失败");
+  });
+
+  it("shows empty practice state when feed returns no questions", async () => {
+    feedPayloadOverride = { ...feedPayload, questions: [], rag_status: { chunks: 4, provider: "local", retrieved: 0, sources: [] } };
+    const wrapper = mount(App);
+    const practiceButton = wrapper.findAll(".mini-button").find((button) => button.text() === "练习题");
+    await practiceButton.trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find('[data-testid="practice-board"]').text()).toContain("暂时没有匹配到练习卡");
+    expect(wrapper.find(".status-pill").text()).toContain("暂无推荐题");
   });
 
   it("polls audio task, shows completion toast, and opens review control room", async () => {
@@ -296,11 +494,59 @@ describe("App workflows", () => {
     await wrapper.find('[data-testid="review-toast"]').trigger("click");
     await flushPromises();
     expect(wrapper.find('[data-testid="review-room"]').text()).toContain("Spring Boot");
+    expect(wrapper.find('[data-testid="review-room"]').text()).not.toContain("interview.wavinterview.wav");
+    expect(wrapper.find(".composer-wrap").exists()).toBe(false);
+    expect(wrapper.find(".system-alert").text()).toContain("期待您的真实录音上传分析");
+    expect(wrapper.find('[data-testid="review-room"]').text()).not.toContain("预分析");
+    expect(wrapper.find('[data-testid="review-room"]').text()).not.toContain("低置信");
+    expect(wrapper.find('[data-testid="review-room"]').text()).not.toContain("语音识别");
+    expect(wrapper.find('[data-testid="review-room"]').text()).not.toContain("音频切分");
     expect(wrapper.find('[data-testid="rag-diagnosis"]').text()).toContain("条件装配");
 
-    await wrapper.find(".diagnosis-card textarea").setValue("补充条件装配。");
-    await wrapper.find(".diagnosis-card .send").trigger("click");
+    await wrapper.find('[data-testid="teacher-correction"] input[type="number"]').setValue(88);
+    await wrapper.find('[data-testid="teacher-correction"] .send').trigger("click");
+    await flushPromises();
+    expect(fetch.mock.calls.find(([url]) => url.endsWith("/reviews/review-1/segments/seg-1"))).toBeTruthy();
+
+    await wrapper.find('textarea[placeholder="给当前句子添加批注"]').setValue("补充条件装配。");
+    await wrapper.findAll(".diagnosis-card .send").at(1).trigger("click");
     await flushPromises();
     expect(wrapper.find(".annotation-card").text()).toContain("补充条件装配");
+
+    await wrapper.find(".review-exit").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".composer-wrap").exists()).toBe(true);
+  });
+
+  it("logs teacher out, clears review state, and stops task polling", async () => {
+    const wrapper = mount(App);
+
+    await wrapper.find(".teacher-chip").trigger("click");
+    await flushPromises();
+    expect(wrapper.find('[data-testid="teacher-session"]').text()).toContain("讲师 Demo");
+
+    await vi.advanceTimersByTimeAsync(3000);
+    await flushPromises();
+    await vi.advanceTimersByTimeAsync(3000);
+    await flushPromises();
+    await wrapper.find('[data-testid="review-toast"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.find('[data-testid="review-room"]').exists()).toBe(true);
+
+    const taskCallsBeforeLogout = fetch.mock.calls.filter(([url]) => url.endsWith("/tasks")).length;
+    await wrapper.find(".teacher-logout").trigger("click");
+    await flushPromises();
+
+    expect(fetch.mock.calls.find(([url]) => url.endsWith("/auth/logout"))).toBeTruthy();
+    expect(wrapper.find(".teacher-chip").text()).toContain("讲师登录");
+    expect(wrapper.find('[data-testid="teacher-session"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="review-room"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="task-queue"]').exists()).toBe(false);
+    expect(wrapper.find(".status-pill").text()).toContain("讲师已退出");
+
+    await vi.advanceTimersByTimeAsync(6000);
+    await flushPromises();
+    const taskCallsAfterLogout = fetch.mock.calls.filter(([url]) => url.endsWith("/tasks")).length;
+    expect(taskCallsAfterLogout).toBe(taskCallsBeforeLogout);
   });
 });

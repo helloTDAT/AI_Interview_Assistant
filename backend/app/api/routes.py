@@ -10,8 +10,10 @@ from app.agents.resume_agent import ResumeEvaluationAgent
 from app.agents.router_agent import RouterAgent
 from app.core.config import settings
 from app.core.database import review_db
-from app.core.storage import store
+from app.core.storage import get_active_resume_profile, store, summarize_active_resume
 from app.models import (
+    AgentPlanRequest,
+    AgentPlanResponse,
     AuthLoginRequest,
     AuthResponse,
     ChatRequest,
@@ -37,6 +39,7 @@ resume_agent = ResumeEvaluationAgent()
 mock_agent = MockInterviewAgent()
 question_agent = QuestionGenerationAgent()
 audio_agent = InterviewAudioAnalysisAgent(question_agent=question_agent)
+planner_agent = router_agent.planner_agent
 
 
 def _save_upload(file: UploadFile) -> Path:
@@ -112,6 +115,11 @@ def chat(payload: ChatRequest) -> ChatResponse:
     return router_agent.route(payload.user_id, payload.message, payload.target_position)
 
 
+@router.post("/agent/plan", response_model=AgentPlanResponse)
+def agent_plan(payload: AgentPlanRequest) -> AgentPlanResponse:
+    return planner_agent.run(payload.user_id, payload.message, payload.target_position)
+
+
 @router.post("/files/resume")
 def upload_resume(
     file: UploadFile = File(...),
@@ -124,6 +132,11 @@ def upload_resume(
     report = resume_agent.analyze(path, target_position, user_instruction, job_description)
     store.resume_reports[user_id] = report.model_dump(mode="python")
     return report
+
+
+@router.get("/resume/current/{user_id}")
+def current_resume(user_id: str) -> dict:
+    return {"resume": summarize_active_resume(user_id)}
 
 
 @router.post("/interviews/mock/start", response_model=MockInterviewResponse)
@@ -236,7 +249,10 @@ def update_segment(
     if payload.speaker is not None:
         segment.speaker = payload.speaker
     if payload.captured_question_title is not None:
-        segment.captured_question_title = payload.captured_question_title
+        captured_title = payload.captured_question_title.strip()
+        segment.captured_question_title = captured_title or None
+        if not captured_title:
+            segment.captured_question_id = None
     if payload.teacher_score is not None:
         segment.teacher_score = max(0, min(100, payload.teacher_score))
     review_db.save_review(review)
@@ -275,16 +291,15 @@ def delete_question(question_id: str) -> dict[str, bool]:
 
 @router.post("/learning/questions")
 def generate_learning_questions(user_id: str = Form("demo-user"), target_position: str = Form("后端开发工程师")):
-    report = store.resume_reports.get(user_id)
-    profile = report["profile"] if report else None
+    profile = get_active_resume_profile(user_id)
     questions = question_agent.generate_for_resume(profile, target_position)
     return {"questions": [q.model_dump(mode="json") for q in questions]}
 
 
 @router.post("/learning/feed")
 def learning_feed(payload: LearningFeedRequest) -> dict:
-    report = store.resume_reports.get(payload.user_id)
-    profile = report["profile"] if report else None
+    profile = get_active_resume_profile(payload.user_id)
+    resume_summary = summarize_active_resume(payload.user_id)
     result = question_agent.feed(
         payload.user_id,
         profile,
@@ -296,6 +311,8 @@ def learning_feed(payload: LearningFeedRequest) -> dict:
         "questions": [q.model_dump(mode="json") for q in result["questions"]],
         "insights": [node.model_dump(mode="json") for node in result["insights"]],
         "rag_status": result["rag_status"],
+        "profile_used": bool(resume_summary.get("available")),
+        "profile_summary": resume_summary,
     }
 
 

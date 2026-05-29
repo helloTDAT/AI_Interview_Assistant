@@ -67,8 +67,9 @@ class InterviewAudioAnalysisAgent:
             acoustic_points = self._acoustic_points(segments)
             report = self._build_report(task, user_id, audio_path.name, transcript, segments, diagnostics, captured, acoustic_points)
 
-            self._update_task(task, user_id, TaskStatus.running, 84, "spark_review", "正在调用 Spark X1.5 生成复盘摘要。")
-            self._merge_spark_review(report)
+            if self._has_real_dialogue(segments):
+                self._update_task(task, user_id, TaskStatus.running, 84, "spark_review", "正在调用 Spark X1.5 生成复盘摘要。")
+                self._merge_spark_review(report)
 
             store.reports.setdefault(user_id, []).append(
                 AbilityReport(
@@ -115,6 +116,7 @@ class InterviewAudioAnalysisAgent:
             cursor = start_ms
             duration = max(1, end_ms - start_ms)
             slice_ms = max(1500, duration // max(1, len(lines)))
+            fallback_chunk = any(self._is_system_notice(line) for line in lines) or self._is_system_notice(text)
             for index, line in enumerate(lines):
                 speaker, content = self._split_speaker(line, len(segments))
                 if not content:
@@ -124,7 +126,7 @@ class InterviewAudioAnalysisAgent:
                     text=content,
                     start_ms=cursor,
                     end_ms=min(end_ms, cursor + slice_ms),
-                    confidence=0.72 if "待接入" in content else 0.86,
+                    confidence=0.45 if speaker == "system" else 0.55 if fallback_chunk else 0.86,
                 )
                 segments.append(segment)
                 cursor = segment.end_ms
@@ -132,9 +134,13 @@ class InterviewAudioAnalysisAgent:
 
     def _split_speaker(self, line: str, index: int) -> tuple[str, str]:
         normalized = line.strip()
+        if self._is_system_notice(normalized):
+            return "system", normalized
         for delimiter in ["：", ":"]:
             if delimiter in normalized:
                 speaker, content = normalized.split(delimiter, 1)
+                if "系统" in speaker or speaker.lower().startswith("system"):
+                    return "system", content.strip()
                 if "面试官" in speaker or speaker.lower().startswith("q"):
                     return "interviewer", content.strip()
                 if "学生" in speaker or "我" in speaker or speaker.lower().startswith("a"):
@@ -146,7 +152,7 @@ class InterviewAudioAnalysisAgent:
     def _capture_questions(self, segments: list[TranscriptSegment]) -> list[CapturedInterviewQuestion]:
         captured: list[CapturedInterviewQuestion] = []
         for segment in segments:
-            if segment.speaker != "interviewer" or not self._is_professional_question(segment.text):
+            if not self._should_diagnose_segment(segment) or not self._is_professional_question(segment.text):
                 continue
             question = self.question_agent.add_real_interview_question(segment.text)
             segment.captured_question_id = question.id
@@ -164,7 +170,7 @@ class InterviewAudioAnalysisAgent:
     def _diagnose_segments(self, segments: list[TranscriptSegment]) -> list[RagDiagnosis]:
         diagnostics: list[RagDiagnosis] = []
         for index, segment in enumerate(segments):
-            if segment.speaker != "interviewer":
+            if not self._should_diagnose_segment(segment):
                 continue
             answer = self._next_student_answer(segments, index)
             chunks = self.rag.search(segment.text, top_k=3)
@@ -225,9 +231,20 @@ class InterviewAudioAnalysisAgent:
     ) -> ReviewReport:
         missing_count = sum(len(item.missing_points) for item in diagnostics)
         filler_count = sum(point.filler_count for point in acoustic_points)
-        accuracy = max(45, 88 - missing_count * 6)
-        fluency = max(45, 90 - filler_count * 8)
-        confidence = max(45, round(sum(point.speech_rate for point in acoustic_points) / max(len(acoustic_points), 1) / 2))
+        has_real_dialogue = self._has_real_dialogue(segments)
+        accuracy = 45 if not has_real_dialogue else max(45, 88 - missing_count * 6)
+        fluency = 45 if not has_real_dialogue else max(45, 90 - filler_count * 8)
+        confidence = 45 if not has_real_dialogue else max(45, round(sum(point.speech_rate for point in acoustic_points) / max(len(acoustic_points), 1) / 2))
+        summary = (
+            "复盘控制室已就绪，期待您的真实录音上传分析。"
+            if not has_real_dialogue
+            else "系统已完成逐句转写、真题捕获和 RAG 漏点诊断。请讲师重点复核知识漏点与关键片段。"
+        )
+        suggestions = (
+            ["上传真实面试录音后，可查看逐句复盘与讲师批注。", "建议优先复盘项目介绍、技术追问和回答结构。", "可结合右侧诊断面板补齐知识点与表达证据。"]
+            if not has_real_dialogue
+            else ["用 STAR 结构补齐回答证据。", "对遗漏知识点准备 30 秒补充说明。", "减少“嗯、啊、然后”等冗余词。"]
+        )
         return ReviewReport(
             task_id=task.id,
             owner_user_id=user_id,
@@ -239,8 +256,8 @@ class InterviewAudioAnalysisAgent:
             captured_questions=captured,
             acoustic_points=acoustic_points,
             dimension_scores={"准确度": accuracy, "流畅度": fluency, "自信度": min(95, confidence)},
-            summary="系统已完成逐句转写、真题捕获和 RAG 漏点诊断。请讲师重点复核红色漏点与低置信度片段。",
-            growth_suggestions=["用 STAR 结构补齐回答证据。", "对遗漏知识点准备 30 秒补充说明。", "减少“嗯、啊、然后”等冗余词。"],
+            summary=summary,
+            growth_suggestions=suggestions,
         )
 
     def _merge_spark_review(self, report: ReviewReport) -> None:
@@ -273,11 +290,34 @@ class InterviewAudioAnalysisAgent:
             for word in ["项目", "Spring", "Redis", "数据库", "索引", "算法", "模型", "缓存", "并发", "架构", "自动装配"]
         )
 
+    def _is_system_notice(self, text: str) -> bool:
+        return any(
+            marker in text
+            for marker in [
+                "语音识别待接入",
+                "音频切分失败",
+                "已接收录音文件",
+                "当前为预分析",
+                "期待您的真实录音上传分析",
+            ]
+        )
+
+    def _should_diagnose_segment(self, segment: TranscriptSegment) -> bool:
+        return segment.speaker == "interviewer" and segment.confidence >= 0.6 and not self._is_system_notice(segment.text)
+
+    def _has_real_dialogue(self, segments: list[TranscriptSegment]) -> bool:
+        return any(
+            segment.speaker in {"interviewer", "student"} and segment.confidence >= 0.6 and not self._is_system_notice(segment.text)
+            for segment in segments
+        )
+
     def _fallback_transcript(self, filename: str) -> str:
         return (
-            f"[语音识别待接入或音频切分失败] 已接收录音文件：{filename}。\n"
-            "面试官：请介绍你最有代表性的项目。\n"
-            "学生：我做过一个智能面试助手项目，负责后端 Agent 调度和简历解析。\n"
-            "面试官：说说你对 Spring Boot 自动装配的理解。\n"
-            "学生：嗯，主要是通过 starter 和一些配置完成自动加载，然后能减少手动配置。"
+            "系统：复盘控制室已准备就绪，期待您的真实录音上传分析。\n"
+            "面试官：请介绍你最有代表性的项目，并说明你的职责、关键技术和最终结果。\n"
+            "学生：我做过一个智能面试助手项目，负责后端 Agent 调度、简历解析和任务状态流转。\n"
+            "面试官：如果这个系统要支持大量录音异步复盘，你会如何设计任务队列、失败重试和进度通知？\n"
+            "学生：我会把上传、切片、转写、RAG 诊断拆成阶段任务，记录进度和错误详情，并在前端轮询或推送完成通知。\n"
+            "面试官：说说你对 Spring Boot 自动装配的理解，以及如何排查自动配置没有生效的问题。\n"
+            "学生：主要是通过 starter、自动配置类和条件注解加载 Bean。排查时我会看依赖、配置属性、条件匹配报告和日志。"
         )

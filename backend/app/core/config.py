@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 20.0
     llm_max_tokens: int = 1800
     rag_vector_dir: str = ".rag"
+    enable_local_finetuned_llm: bool = False
+    local_finetuned_model_path: str | None = None
+    local_lora_adapter_path: str | None = None
 
     xfyun_app_id: str | None = None
     xfyun_api_key: str | None = None

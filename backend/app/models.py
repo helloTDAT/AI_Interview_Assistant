@@ -85,6 +85,39 @@ class ChatResponse(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
 
 
+class AgentPlanRequest(BaseModel):
+    user_id: str = "demo-user"
+    message: str
+    target_position: str = "后端开发工程师"
+
+
+class AgentPlanStep(BaseModel):
+    name: str
+    tool_name: str
+    input_summary: str = ""
+    status: str = "pending"
+
+
+class AgentToolTrace(BaseModel):
+    tool_name: str
+    status: str
+    summary: str
+    fallback: str | None = None
+
+
+class AgentPlan(BaseModel):
+    user_goal: str
+    context_summary: str
+    steps: list[AgentPlanStep] = Field(default_factory=list)
+
+
+class AgentPlanResponse(BaseModel):
+    plan: AgentPlan
+    traces: list[AgentToolTrace] = Field(default_factory=list)
+    final_message: str
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
 class AuthLoginRequest(BaseModel):
     username: str
     password: str
@@ -130,6 +163,8 @@ class MockInterviewResponse(BaseModel):
     question_type: str = "project"
     phase_label: str | None = None
     anchor_project: str | None = None
+    resume_context_used: bool = False
+    resume_context_summary: str | None = None
     difficulty_level: str | None = None
     question_intent: str | None = None
     probing_reason: str | None = None
@@ -144,6 +179,7 @@ class MockInterviewResponse(BaseModel):
 class Question(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     title: str
+    prompt: str = ""
     answer_reference: str = ""
     source: QuestionSource = QuestionSource.generated
     position: str | None = None

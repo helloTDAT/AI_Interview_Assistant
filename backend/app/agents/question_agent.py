@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+import re
+from collections import defaultdict
 from typing import Any
 
 from app.core.storage import store
@@ -41,19 +42,22 @@ class QuestionGenerationAgent:
     ) -> dict[str, Any]:
         skills = self._skills(profile, target_position)
         desired_difficulty = self._next_difficulty(last_answer_score)
-        self._maybe_generate_questions(target_position, skills, desired_difficulty, max(0, limit - 3))
+        contexts = self.rag.search(f"{target_position} {' '.join(skills)}", top_k=4, skill_tags=skills)
+        self._maybe_generate_questions(target_position, skills, desired_difficulty, max(0, limit - 3), contexts)
         questions = sorted(
             store.questions.values(),
             key=lambda question: self._rank(question, target_position, skills, desired_difficulty),
             reverse=True,
         )
-        selected = questions[: max(1, min(limit, 20))]
+        selected = self._balanced_selection(questions, skills, max(1, min(limit, 20)))
         return {
             "questions": selected,
             "insights": self.insights(user_id, skills),
             "rag_status": {
                 "chunks": len(store.rag_chunks),
-                "provider": "chatanywhere",
+                "provider": "local",
+                "retrieved": len(contexts),
+                "sources": self._rag_sources(contexts),
                 "fallback_ready": True,
             },
         }
@@ -123,6 +127,7 @@ class QuestionGenerationAgent:
                 return question
         question = Question(
             title=normalized,
+            prompt="请先给出核心结论，再结合真实面试场景说明方案、边界和追问点。",
             answer_reference="来自真实面试录音，建议结合岗位要求补充标准答案与追问点。",
             source=QuestionSource.real_interview,
             position=target_position,
@@ -135,48 +140,37 @@ class QuestionGenerationAgent:
         self.rag.add_question(question)
         return question
 
-    def _maybe_generate_questions(self, target_position: str, skills: list[str], difficulty: str, count: int) -> None:
+    def _maybe_generate_questions(
+        self,
+        target_position: str,
+        skills: list[str],
+        difficulty: str,
+        count: int,
+        contexts: list[Any] | None = None,
+    ) -> None:
         if count <= 0:
             return
         existing_titles = {question.title for question in store.questions.values()}
-        contexts = self.rag.search(f"{target_position} {' '.join(skills)}", top_k=4, skill_tags=skills)
-        result = self.llm.generate_learning_questions(
-            target_position=target_position,
-            skills=skills,
-            rag_context=[chunk.text for chunk in contexts],
-            count=count,
-            difficulty=difficulty,
-        )
-        if result.ok and result.data and isinstance(result.data.get("questions"), list):
-            for item in result.data["questions"][:count]:
-                if not isinstance(item, dict) or not item.get("title") or item["title"] in existing_titles:
-                    continue
-                question = Question(
-                    title=str(item["title"]),
-                    answer_reference=str(item.get("answer_reference") or "请围绕场景、方案、难点、结果展开回答。"),
-                    source=QuestionSource.generated,
-                    position=target_position,
-                    skill_tags=[str(tag) for tag in item.get("skill_tags", [])][:6] or skills[:2],
-                    difficulty=str(item.get("difficulty") or difficulty),
-                )
-                store.questions[question.id] = question
-                self.rag.add_question(question)
-            return
-
-        for skill in skills[:count]:
-            title = f"请结合你的经历说明你如何使用 {skill} 解决实际问题。"
+        generated_count = 0
+        local_blueprints = self._local_question_blueprints(skills, target_position, difficulty, contexts or [])
+        for title, prompt, tags in local_blueprints:
             if title in existing_titles:
                 continue
             question = Question(
                 title=title,
-                answer_reference="建议说明场景、技术选择、实现步骤、难点处理和结果指标。",
+                prompt=prompt,
+                answer_reference="建议说明核心概念、适用场景、方案取舍、风险边界和可验证结果。",
                 source=QuestionSource.generated,
                 position=target_position,
-                skill_tags=[skill],
+                skill_tags=tags,
                 difficulty=difficulty,
             )
             store.questions[question.id] = question
             self.rag.add_question(question)
+            existing_titles.add(title)
+            generated_count += 1
+            if generated_count >= count:
+                break
 
     def _skills(self, profile: ResumeProfile | dict | None, target_position: str) -> list[str]:
         if isinstance(profile, ResumeProfile) and profile.skills:
@@ -216,6 +210,33 @@ class QuestionGenerationAgent:
             score += 0.7
         return score
 
+    def _balanced_selection(self, questions: list[Question], skills: list[str], limit: int) -> list[Question]:
+        buckets = [
+            ("real", lambda q: q.source == QuestionSource.real_interview),
+            ("project", lambda q: any(tag in {"项目经历", "真实面试", "沟通表达"} for tag in q.skill_tags) or "项目" in q.title),
+            ("skill", lambda q: any(tag in skills for tag in q.skill_tags)),
+            ("foundation", lambda q: any(tag in {"数据库", "MySQL", "Redis", "并发", "HTTP", "JVM", "网络"} for tag in q.skill_tags)),
+            ("algorithm", lambda q: any(tag in {"算法", "复杂度", "数据结构"} for tag in q.skill_tags) or "算法" in q.title),
+            ("system", lambda q: "系统" in q.title or "设计" in q.title or any(tag == "系统设计" for tag in q.skill_tags)),
+        ]
+        selected: list[Question] = []
+        seen: set[str] = set()
+        for _, matcher in buckets:
+            for question in questions:
+                if question.id not in seen and matcher(question):
+                    selected.append(question)
+                    seen.add(question.id)
+                    break
+            if len(selected) >= limit:
+                return selected
+        for question in questions:
+            if question.id in seen:
+                continue
+            selected.append(question)
+            if len(selected) >= limit:
+                break
+        return selected
+
     def _feedback_from_llm(self, question_id: str, data: dict[str, Any]) -> LearningAnswerFeedback:
         score = self._clamp(data.get("score", 0))
         return LearningAnswerFeedback(
@@ -249,6 +270,123 @@ class QuestionGenerationAgent:
             next_difficulty=self._next_difficulty(score),
             source="rules",
         )
+
+    def _normalize_question_text(self, raw_title: str, raw_prompt: str = "") -> tuple[str, str]:
+        title = self._clean_text(raw_title)
+        prompt = self._clean_text(raw_prompt)
+        markers = ["要求包含", "请按 STAR", "提示：", "提示:", "回答要点", "要求包括", "请说明", "请描述"]
+        should_split = len(title) > 60 or any(marker in title for marker in markers) or title.count("；") >= 2 or title.count("，") >= 4
+        if should_split:
+            prompt = prompt or title
+            title = self._short_title_from_text(title)
+        return title[:60].strip(" ，。；;") or "综合面试练习题", self._compact_prompt(prompt)
+
+    def _short_title_from_text(self, text: str) -> str:
+        compact = re.sub(r"[\s　]+", "", text)
+        patterns = [
+            r"(Redis|MySQL|SQL|Netty|RocketMQ|Spring|JVM|HTTP|PyTorch|Python|Java|WebRTC|RAG|Agent)[^，。；;]{0,24}",
+            r"(缓存|数据库|接口|并发|索引|事务|算法|系统设计|项目沟通|项目复盘)[^，。；;]{0,24}",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, compact, flags=re.I)
+            if match:
+                candidate = match.group(0).strip(" ：:，。；;")
+                if 6 <= len(candidate) <= 40:
+                    return candidate if candidate.endswith("？") else f"{candidate}怎么处理？"
+        first = re.split(r"[。；;\n]", text)[0].strip()
+        first = re.sub(r"^(请|面试官可能会追问：?|请按STAR结构，?)", "", first).strip()
+        if len(first) > 40:
+            first = first[:40]
+        return first if first.endswith("？") else f"{first}？"
+
+    def _compact_prompt(self, text: str) -> str:
+        compact = self._clean_text(text)
+        if not compact:
+            return "请用 2-3 分钟回答，覆盖场景、方案、难点和结果。"
+        parts = [part.strip(" -•·\t") for part in re.split(r"[。\n；;]", compact) if part.strip()]
+        return "；".join(parts[:3])[:220]
+
+    def _fallback_question_text(self, skill: str, target_position: str, difficulty: str) -> tuple[str, str]:
+        templates = {
+            "Redis": ("Redis 缓存一致性怎么处理？", "结合岗位场景说明缓存更新策略、失效风险和兜底方案。"),
+            "MySQL": ("MySQL 慢查询怎么定位？", "说明索引、执行计划、数据量和 SQL 改写的排查顺序。"),
+            "SQL": ("SQL 查询结果异常怎么排查？", "结合表结构、过滤条件、聚合逻辑和边界数据说明排查路径。"),
+            "Java": ("Java 并发问题怎么定位？", "说明线程安全、锁、线程池和线上观测指标。"),
+            "Python": ("Python 服务性能瓶颈怎么优化？", "结合 I/O、异步、批处理和监控指标说明方案。"),
+            "PyTorch": ("PyTorch 训练效果不好怎么排查？", "说明数据、模型、损失函数、评估指标和实验对比。"),
+            "算法": ("Top K 问题如何设计？", "说明数据结构选择、复杂度、边界条件和大数据场景。"),
+        }
+        if skill in templates:
+            return templates[skill]
+        if difficulty == "hard":
+            return f"{skill} 线上故障怎么应对？", f"结合{target_position}场景，说明定位、止损、恢复和复盘。"
+        if difficulty == "easy":
+            return f"{skill} 的核心概念是什么？", "先解释定义，再说明适用场景和常见误区。"
+        return f"{skill} 在项目中怎么落地？", "说明使用场景、关键实现、风险边界和结果验证。"
+
+    def _local_question_blueprints(
+        self,
+        skills: list[str],
+        target_position: str,
+        difficulty: str,
+        contexts: list[Any],
+    ) -> list[tuple[str, str, list[str]]]:
+        blueprints: list[tuple[str, str, list[str]]] = []
+        for skill in skills:
+            title, prompt = self._fallback_question_text(skill, target_position, difficulty)
+            blueprints.append((title, prompt, [skill]))
+        context_text = "\n".join(getattr(chunk, "text", "") for chunk in contexts)
+        context_tags = list(dict.fromkeys(tag for chunk in contexts for tag in getattr(chunk, "skill_tags", [])))
+        if any(word in context_text for word in ["RAG", "Agent", "检索", "切片"]):
+            blueprints.append(
+                (
+                    "一个完整 Agent 一般包含哪些部分？",
+                    "请说明规划、工具调用、记忆/上下文、状态管理、评估和安全边界。",
+                    ["Agent", "RAG", "系统设计"],
+                )
+            )
+        if any(word in context_text for word in ["Top K", "LRU", "复杂度", "算法"]):
+            blueprints.append(
+                (
+                    "LRU 缓存如何做到 O(1)？",
+                    "说明哈希表、双向链表、读写更新、淘汰策略和并发边界。",
+                    ["算法", "数据结构"],
+                )
+            )
+        if any(word in context_text for word in ["系统设计", "缓存", "队列", "幂等"]):
+            blueprints.append(
+                (
+                    "高并发系统如何做降级和兜底？",
+                    "请覆盖容量评估、缓存、队列、限流、降级、幂等和监控告警。",
+                    ["系统设计", "并发"],
+                )
+            )
+        if context_tags:
+            title = f"{context_tags[0]} 面试高频点怎么准备？"
+            prompt = "结合本地 RAG 命中的知识片段，说明核心概念、常见追问和项目中的落地证据。"
+            blueprints.append((title, prompt, context_tags[:4]))
+        return blueprints
+
+    def _rag_sources(self, contexts: list[Any]) -> list[dict[str, str]]:
+        sources = []
+        seen = set()
+        for chunk in contexts:
+            key = (getattr(chunk, "repo", ""), getattr(chunk, "path", ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            sources.append(
+                {
+                    "title": getattr(chunk, "title", ""),
+                    "repo": getattr(chunk, "repo", ""),
+                    "license": getattr(chunk, "license", ""),
+                    "source_url": getattr(chunk, "source_url", ""),
+                }
+            )
+        return sources[:4]
+
+    def _clean_text(self, text: str) -> str:
+        return re.sub(r"\s+", " ", str(text or "")).strip()
 
     def _clamp(self, value: Any) -> int:
         try:

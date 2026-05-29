@@ -7,7 +7,7 @@ from uuid import uuid4
 from langgraph.graph import END, StateGraph
 
 from app.agents.question_agent import QuestionGenerationAgent
-from app.core.storage import store
+from app.core.storage import get_active_resume_report, store
 from app.models import MockInterviewResponse, ResumeProfile
 from app.services.ai_clients import LLMClient
 
@@ -84,11 +84,14 @@ class MockInterviewAgent:
         mode: str = "project_deep_dive",
     ) -> MockInterviewResponse:
         mode = self._normalize_mode(mode)
-        report = store.resume_reports.get(user_id)
+        report = get_active_resume_report(user_id)
         profile = report["profile"] if report else None
-        resume_context = self._resume_context(profile)
+        resume_context = self._resume_context(profile, report)
         anchor_project = self._select_anchor_project(resume_context, target_position)
-        has_resume_context = bool(anchor_project)
+        has_resume_context = self._has_resume_context(resume_context)
+        if has_resume_context and not anchor_project:
+            anchor_project = self._fallback_anchor(resume_context, target_position)
+        context_summary = self._resume_context_summary(resume_context, has_resume_context)
         resume_questions = (
             self.question_agent.generate_for_resume(profile, target_position, count=3)
             if has_resume_context
@@ -104,6 +107,7 @@ class MockInterviewAgent:
             "resume_context": resume_context,
             "anchor_project": anchor_project,
             "has_resume_context": has_resume_context,
+            "resume_context_summary": context_summary,
             "plan": plan,
             "plan_index": 0,
             "current_question": first_item,
@@ -141,6 +145,8 @@ class MockInterviewAgent:
             question_type=first_item["question_type"],
             phase_label=first_item["phase_label"],
             anchor_project=anchor_project,
+            resume_context_used=has_resume_context,
+            resume_context_summary=context_summary,
             difficulty_level=first_item["difficulty_level"],
             question_intent=first_item["question_intent"],
             pressure_level=38 if mode != "behavioral" else 52,
@@ -414,6 +420,8 @@ class MockInterviewAgent:
             "question_type": question_type,
             "phase_label": item.get("phase_label"),
             "anchor_project": session.get("anchor_project"),
+            "resume_context_used": bool(session.get("has_resume_context")),
+            "resume_context_summary": session.get("resume_context_summary"),
             "difficulty_level": item.get("difficulty_level"),
             "question_intent": item.get("question_intent"),
             "probing_reason": probing_reason,
@@ -751,13 +759,18 @@ class MockInterviewAgent:
             "question_intent": question_intent,
         }
 
-    def _resume_context(self, profile: ResumeProfile | dict | None) -> dict[str, Any]:
+    def _resume_context(self, profile: ResumeProfile | dict | None, report: dict[str, Any] | None = None) -> dict[str, Any]:
+        report = report or {}
         if isinstance(profile, ResumeProfile):
             return {
                 "projects": profile.projects[:5],
                 "internships": profile.internships[:3],
                 "skills": profile.skills[:12],
                 "raw_text": profile.raw_text[:1800],
+                "parse_confidence": profile.parse_confidence,
+                "warnings": profile.warnings,
+                "star_optimizations": report.get("star_optimizations", [])[:3],
+                "interview_risks": report.get("interview_risks", [])[:3],
             }
         if isinstance(profile, dict):
             return {
@@ -765,11 +778,20 @@ class MockInterviewAgent:
                 "internships": [str(item) for item in profile.get("internships", [])][:3],
                 "skills": [str(item) for item in profile.get("skills", [])][:12],
                 "raw_text": str(profile.get("raw_text", ""))[:1800],
+                "parse_confidence": float(profile.get("parse_confidence") or 0),
+                "warnings": profile.get("warnings", []),
+                "star_optimizations": report.get("star_optimizations", [])[:3],
+                "interview_risks": report.get("interview_risks", [])[:3],
             }
         return {"projects": [], "internships": [], "skills": [], "raw_text": ""}
 
     def _select_anchor_project(self, resume_context: dict[str, Any], target_position: str) -> str | None:
-        candidates = [*resume_context.get("projects", []), *resume_context.get("internships", [])]
+        candidates = [
+            *resume_context.get("projects", []),
+            *resume_context.get("internships", []),
+            *self._experience_lines_from_raw_text(resume_context.get("raw_text", "")),
+            *self._experience_lines_from_report(resume_context),
+        ]
         ranked: list[tuple[int, str]] = []
         role_terms = self._role_anchor_terms(target_position)
         for item in candidates:
@@ -788,6 +810,78 @@ class MockInterviewAgent:
             return None
         ranked.sort(key=lambda item: item[0], reverse=True)
         return ranked[0][1]
+
+    def _has_resume_context(self, resume_context: dict[str, Any]) -> bool:
+        if resume_context.get("projects") or resume_context.get("internships"):
+            return True
+        if resume_context.get("skills"):
+            return True
+        if self._experience_lines_from_raw_text(resume_context.get("raw_text", "")):
+            return True
+        if self._experience_lines_from_report(resume_context):
+            return True
+        return False
+
+    def _fallback_anchor(self, resume_context: dict[str, Any], target_position: str) -> str | None:
+        skills = [str(skill) for skill in resume_context.get("skills", []) if str(skill).strip()]
+        if skills:
+            shown = "、".join(skills[:6])
+            return f"简历技能画像：简历中出现 {shown}。本轮将围绕这些能力追问在{target_position}场景中的项目落地证据。"
+        lines = self._experience_lines_from_raw_text(resume_context.get("raw_text", ""))
+        return lines[0] if lines else None
+
+    def _resume_context_summary(self, resume_context: dict[str, Any], used: bool) -> str | None:
+        if not used:
+            return None
+        project_count = len(resume_context.get("projects", []))
+        internship_count = len(resume_context.get("internships", []))
+        skills = [str(skill) for skill in resume_context.get("skills", [])][:5]
+        confidence = resume_context.get("parse_confidence")
+        prefix = "已读取简历画像"
+        try:
+            if confidence is not None and float(confidence) < 0.6:
+                prefix = "已读取低置信度简历画像"
+        except (TypeError, ValueError):
+            pass
+        pieces = []
+        if project_count or internship_count:
+            pieces.append(f"{project_count} 个项目 / {internship_count} 段实习")
+        if skills:
+            pieces.append(f"技能：{'、'.join(skills)}")
+        return f"{prefix}，" + "，".join(pieces) if pieces else prefix
+
+    def _experience_lines_from_raw_text(self, raw_text: str) -> list[str]:
+        if not raw_text:
+            return []
+        lines = []
+        for raw in re.split(r"[\n。；;]", raw_text):
+            line = self._clean_anchor(raw)
+            if not line or self._looks_like_heading(line):
+                continue
+            if len(line) < 12:
+                continue
+            if self._looks_like_system_placeholder(line):
+                continue
+            if any(word in line for word in ["负责", "参与", "设计", "实现", "优化", "项目", "系统", "平台", "实习", "开发", "搭建"]):
+                lines.append(line)
+        return list(dict.fromkeys(lines))[:3]
+
+    def _experience_lines_from_report(self, resume_context: dict[str, Any]) -> list[str]:
+        lines: list[str] = []
+        for item in resume_context.get("star_optimizations", []) or []:
+            if isinstance(item, dict):
+                text = str(item.get("before") or item.get("after") or "")
+                if text and not self._looks_like_heading(text):
+                    lines.append(text)
+        for item in resume_context.get("interview_risks", []) or []:
+            if isinstance(item, dict):
+                question = str(item.get("question") or "")
+                if question and "具体经历" in question:
+                    lines.append(question)
+        return list(dict.fromkeys(lines))[:3]
+
+    def _looks_like_system_placeholder(self, text: str) -> bool:
+        return any(marker in text for marker in ["OCR待接入", "已接收图片简历", "扫描版", "请接入真实 OCR"])
 
     def _role_anchor_terms(self, target_position: str) -> list[str]:
         if self._is_ai_role(target_position):

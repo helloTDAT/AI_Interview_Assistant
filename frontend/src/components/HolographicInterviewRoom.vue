@@ -52,6 +52,7 @@
         </div>
         <p>{{ phaseLabel }}</p>
         <small v-if="currentTurn?.anchor_project">锚定经历：{{ anchorSummary }}</small>
+        <small v-else-if="currentTurn?.resume_context_used">{{ currentTurn.resume_context_summary || "已读取简历画像，本轮围绕技能与经历线索推进。" }}</small>
         <small v-else>未读取到简历项目，本轮按岗位通用流程推进。</small>
       </section>
 
