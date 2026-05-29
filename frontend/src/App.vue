@@ -11,7 +11,7 @@
     <main class="workspace">
       <header class="topbar">
         <div>
-          <h1>智能面试助手</h1>
+          <h1>OfferNexus智能面试助手</h1>
           <p>统一入口调度简历评估、模拟面试、录音复盘和练习题 Agent。</p>
         </div>
         <div class="status-pill"><span class="dot"></span>{{ agentStatus }}</div>
@@ -96,6 +96,10 @@
               <button type="button" @click="quickPrompt('我想上传真实面试录音做复盘。')">
                 <strong>复盘录音</strong>
                 <span>任务队列、逐句诊断、讲师批注。</span>
+              </button>
+              <button type="button" @click="openPracticeFeed">
+                <strong>专项刷题</strong>
+                <span>基于简历画像和 RAG 题库推荐练习。</span>
               </button>
             </div>
           </section>
